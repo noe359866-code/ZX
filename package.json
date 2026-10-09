@@ -1,0 +1,31 @@
+{
+  "name": "unlimplay-proxy-stream",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Addon proxy de Stremio (Cloudflare Worker) que resuelve flujos HLS desde el embed de UnlimPlay.",
+  "main": "src/index.js",
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "dev": "wrangler dev --ip 0.0.0.0 --port 8787",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "mock": "node tools/mock-origin.mjs",
+    "dev:local": "wrangler dev --ip 0.0.0.0 --port 8787 --var SOURCE_ORIGIN:http://127.0.0.1:8788"
+  },
+  "keywords": [
+    "stremio",
+    "addon",
+    "cloudflare-worker",
+    "hls",
+    "m3u8",
+    "proxy"
+  ],
+  "license": "AGPL-3.0-or-later",
+  "devDependencies": {
+    "wrangler": "^4.149.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
