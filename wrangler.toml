@@ -1,0 +1,37 @@
+# ============================================================================
+#  Configuración de despliegue (wrangler v3)
+#  Alternativa: copiar el contenido de src/index.js al panel de Cloudflare
+#  Workers (Create Worker) y pegar las variables de [vars] en Settings.
+# ============================================================================
+
+name = "unlimplay-proxy-stream"
+main = "src/index.js"
+compatibility_date = "2025-09-01"
+
+# Node.js nos da URL, AbortSignal.timeout() y utilidades estándar en el runtime.
+compatibility_flags = ["nodejs_compat"]
+
+# Envío de logs a Workers Logs (útil para depurar el scraping).
+[observability]
+enabled = true
+
+[vars]
+# "1" → el stream apunta a la pasarela HLS del Worker (necesario en Stremio Web).
+# "0" → devuelve la URL .m3u8 directa con behaviorHints.requestHeaders (default).
+PROXY_HLS = "0"
+
+# "1" → si el HTML del embed no trae el .m3u8, sigue los endpoints de
+# configuración del reproductor (máx. 2 peticiones extra).
+DEEP_SCAN = "1"
+
+# Nº máximo de candidatos .m3u8 devueltos como streams alternativos.
+MAX_STREAMS = "3"
+
+# "1" → marca el stream como no reproducible en navegador cuando depende de
+# cabeceras propias (Referer). En modo PROXY_HLS se ignora.
+NOT_WEB_READY = "1"
+
+# Descomenta para fijar un dominio propio:
+# routes = [
+#   { pattern = "stremio.tudominio.com", custom_domain = true }
+# ]

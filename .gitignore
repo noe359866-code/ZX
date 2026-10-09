@@ -1,0 +1,15 @@
+# Dependencias y build
+node_modules/
+dist/
+.wrangler/
+.dev.vars
+
+# Entorno y logs
+.env
+*.log
+
+# Sistema operativo / editores
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
