@@ -15,6 +15,7 @@
  *    GET /f/embed/movie/tt9999999   → HTML con deep-scan: el .m3u8 viene de /api
  *    GET /api/source/tt9999999      → JSON con la URL del stream
  *    GET /f/embed/movie/tt0000000   → HTML sin ningún .m3u8
+ *    GET /f/embed/tv/{id}/{s}/{e}   → HTML con JWPlayer para probar series
  *    GET /hls/.../*.m3u8            → playlists (exigen Referer, si no → 403)
  *    GET /hls/.../*.ts              → segmentos de pega (exigen Referer)
  * ============================================================================
@@ -118,6 +119,7 @@ const server = createServer((req, res) => {
   if (path === '/f/embed/movie/tt1234567') return send(res, 200, embedJwplayer(req));
   if (path === '/f/embed/movie/tt9999999') return send(res, 200, embedDeepScan(req));
   if (path === '/f/embed/movie/tt0000000') return send(res, 200, embedEmpty());
+  if (path.startsWith('/f/embed/tv/')) return send(res, 200, embedJwplayer(req));
   if (path.startsWith('/f/embed/movie/')) return send(res, 200, embedJwplayer(req));
 
   // --- API usada por el deep-scan ------------------------------------------

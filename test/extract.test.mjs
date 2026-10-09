@@ -54,6 +54,11 @@ test('normalizeSource: variantes unicode, hex y entidades HTML', () => {
   assert.equal(clean, 'a/b /c /d /e /f &g &h');
 });
 
+test('normalizeSource: doble escape JS y entidades HTML de URL', () => {
+  const { clean } = normalizeSource(String.raw`https\u003A\u002F\u002Fcdn.example.net\u002Fhls\u002Em3u8&quest;token&equals;x`);
+  assert.equal(clean, 'https://cdn.example.net/hls.m3u8?token=x');
+});
+
 test('normalizeSource: une concatenaciones JS en la variante flat', () => {
   const { clean, flat } = normalizeSource('var u = "https://cdn.example.com/h/" + "master.m3u8";');
   assert.ok(!/cdn\.example\.com\/h\/master\.m3u8/.test(clean));
@@ -163,6 +168,32 @@ test('extract: entidades HTML &#47;', () => {
   assert.deepEqual(urls, ['https://cdn8.example.net/a/master.m3u8']);
 });
 
+test('extract: URL con caracteres JS Unicode y entidades nombradas', () => {
+  const source = String.raw`player.src("https\\u003A\\u002F\\u002Fcdn10.example.net\\u002Fhls\\u002Fmaster\\u002Em3u8?token\\u003Dx")`;
+  assert.deepEqual(extractM3u8Urls(source, BASE), [
+    'https://cdn10.example.net/hls/master.m3u8?token=x',
+  ]);
+});
+
+test('extract: URL Base64 y doble percent-encoding', () => {
+  const encoded = Buffer.from('https://cdn11.example.net/hls/master.m3u8?token=x').toString('base64');
+  const base64 = extractM3u8Urls(`<script>const video = "${encoded}";</script>`, BASE);
+  assert.deepEqual(base64, ['https://cdn11.example.net/hls/master.m3u8?token=x']);
+
+  const percent = extractM3u8Urls(
+    '<iframe src="/player?source=https%253A%252F%252Fcdn12.example.net%252Fhls%252Fmaster.m3u8%253Ftoken%253Dx"></iframe>',
+    BASE,
+  );
+  assert.deepEqual(percent, ['https://cdn12.example.net/hls/master.m3u8?token=x']);
+});
+
+test('extract: source con ruta HLS relativa explícita', () => {
+  assert.deepEqual(
+    extractM3u8Urls('<video><source src="/hls/master.m3u8?token=x"></video>', BASE),
+    ['https://unlimplay.com/hls/master.m3u8?token=x'],
+  );
+});
+
 test('extract: sin .m3u8 devuelve array vacío', () => {
   assert.deepEqual(extractM3u8Urls(FIXTURES.empty, BASE), []);
   assert.deepEqual(extractM3u8Urls('', BASE), []);
@@ -213,8 +244,19 @@ test('findConfigUrls: detecta endpoints de API y descarta estáticos', () => {
   const urls = findConfigUrls(html, BASE);
   assert.ok(urls.includes('https://unlimplay.com/api/source/tt1234567'));
   assert.ok(urls.includes('https://api.example.net/player/config.php?id=tt1234567'));
-  assert.ok(!urls.some((u) => u.endsWith('player.js')));
+  assert.ok(urls.includes('https://unlimplay.com/assets/player.js'));
   assert.ok(!urls.some((u) => u.endsWith('logo.png')));
+});
+
+test('findConfigUrls: sigue iframes de players públicos y bloquea IP local externa', () => {
+  const html = '<iframe src="https://player.example.net/embed/abc"></iframe><iframe src="http://127.0.0.1/admin"></iframe>';
+  const urls = findConfigUrls(html, BASE);
+  assert.ok(urls.includes('https://player.example.net/embed/abc'));
+  assert.ok(!urls.some((url) => url.includes('127.0.0.1')));
+
+  // El origen local propio sí se permite para el mock de desarrollo.
+  const local = findConfigUrls('<script>fetch("/api/source/tt1")</script>', 'http://127.0.0.1:8788/f/embed/movie/tt1');
+  assert.deepEqual(local, ['http://127.0.0.1:8788/api/source/tt1']);
 });
 
 test('findConfigUrls: sin candidatos devuelve vacío', () => {
@@ -263,7 +305,7 @@ test('buildManifest: cumple el contrato de Stremio', () => {
   assert.equal(m.id, 'com.cf.unlimplay.proxy');
   assert.equal(m.name, 'UnlimPlay Proxy Stream');
   assert.deepEqual(m.resources, ['stream']);
-  assert.deepEqual(m.types, ['movie']);
+  assert.deepEqual(m.types, ['movie', 'series']);
   assert.deepEqual(m.idPrefixes, ['tt', 'tmdb:']);
   assert.ok(m.version && m.description);
 });
@@ -304,13 +346,20 @@ test('resolveSource: valores por defecto exigidos por el addon', async () => {
   assert.equal(s.origin, 'https://unlimplay.com');
   assert.equal(s.referer, 'https://unlimplay.com/');
   assert.equal(s.embedUrl('tt1234567'), 'https://unlimplay.com/f/embed/movie/tt1234567');
+  assert.equal(s.tvEmbedPath, '/f/embed/tv/');
+  assert.equal(s.embedUrlFor('series', 'tt0903747', 1, 2), 'https://unlimplay.com/f/embed/tv/tt0903747/1/2');
 });
 
 test('resolveSource: sobrescribible por variables de entorno', async () => {
   const { resolveSource } = await import('../src/index.js');
-  const s = resolveSource({ SOURCE_ORIGIN: 'https://mirror.example.org/', EMBED_PATH: 'embed/movie' });
+  const s = resolveSource({
+    SOURCE_ORIGIN: 'https://mirror.example.org/',
+    EMBED_PATH: 'embed/movie',
+    TV_EMBED_PATH: 'embed/tv',
+  });
   assert.equal(s.origin, 'https://mirror.example.org');
   assert.equal(s.referer, 'https://mirror.example.org/');
   assert.equal(s.embedUrl('tt1'), 'https://mirror.example.org/embed/movie/tt1');
   assert.equal(s.embedUrl('a b'), 'https://mirror.example.org/embed/movie/a%20b');
+  assert.equal(s.embedUrlFor('series', 'tt1', 2, 4), 'https://mirror.example.org/embed/tv/tt1/2/4');
 });

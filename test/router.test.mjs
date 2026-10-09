@@ -50,6 +50,7 @@ test('OPTIONS: responde 204 con cabeceras CORS', async () => {
   assert.equal(res.status, 204);
   assert.equal(res.headers.get('Access-Control-Allow-Origin'), '*');
   assert.match(res.headers.get('Access-Control-Allow-Methods'), /GET/);
+  assert.match(res.headers.get('Access-Control-Expose-Headers'), /X-Proxy-Detail/);
 });
 
 test('todas las respuestas GET llevan Access-Control-Allow-Origin: *', async () => {
@@ -92,7 +93,7 @@ test('GET /manifest.json: contrato exacto de Stremio', async () => {
   assert.equal(m.id, 'com.cf.unlimplay.proxy');
   assert.equal(m.name, 'UnlimPlay Proxy Stream');
   assert.deepEqual(m.resources, ['stream']);
-  assert.deepEqual(m.types, ['movie']);
+  assert.deepEqual(m.types, ['movie', 'series']);
   assert.deepEqual(m.idPrefixes, ['tt', 'tmdb:']);
 });
 
@@ -196,6 +197,110 @@ test('deep scan: encuentra el .m3u8 en la API de configuración', async () => {
   assert.equal(body.streams.length, 1);
   assert.equal(body.streams[0].url, 'https://cdn.unlimplay.com/x/master.m3u8?t=1');
   assert.equal(calls.length, 2, 'una petición al embed + una al endpoint de configuración');
+});
+
+test('deep scan sigue iframes anidados hasta la configuración HLS', async () => {
+  const calls = mockFetch((url) => {
+    if (url === EMBED_URL) return htmlResponse('<iframe src="/embed/player/tt1234567"></iframe>');
+    if (url === 'https://unlimplay.com/embed/player/tt1234567') {
+      return htmlResponse('<iframe src="/player/config.php?id=tt1234567"></iframe>');
+    }
+    if (url === 'https://unlimplay.com/player/config.php?id=tt1234567') {
+      return new Response(JSON.stringify({ file: 'https://cdn.example.net/hls/master.m3u8?token=live' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+    throw new Error(`petición inesperada: ${url}`);
+  });
+
+  const res = await call('/stream/movie/tt1234567.json');
+  const { streams } = await res.json();
+  assert.equal(streams.length, 1);
+  assert.equal(streams[0].url, 'https://cdn.example.net/hls/master.m3u8?token=live');
+  assert.equal(calls.length, 3, 'embed + iframe + endpoint de configuración');
+});
+
+test('redirect del embed: resuelve las fuentes relativas contra la URL final', async () => {
+  const calls = mockFetch((url) => {
+    assert.equal(url, EMBED_URL);
+    return {
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      url: 'https://player.example.net/embed/page.html',
+      headers: new Headers({ 'Content-Type': 'text/html; charset=utf-8' }),
+      text: async () => '<video><source src="../hls/master.m3u8?token=r"></video>',
+    };
+  });
+
+  const res = await call('/stream/movie/tt1234567.json');
+  const { streams } = await res.json();
+  assert.equal(streams[0].url, 'https://player.example.net/hls/master.m3u8?token=r');
+  assert.equal(calls.length, 1);
+});
+
+test('redirect directo a un playlist: devuelve la URL final aunque el body sea M3U8', async () => {
+  const playlistUrl = 'https://cdn.example.net/live/master.m3u8?signature=signed';
+  mockFetch(() => ({
+    ok: true,
+    status: 200,
+    statusText: 'OK',
+    url: playlistUrl,
+    headers: new Headers({ 'Content-Type': 'application/vnd.apple.mpegurl' }),
+    text: async () => '#EXTM3U\\n#EXT-X-ENDLIST',
+  }));
+
+  const res = await call('/stream/movie/tt1234567.json');
+  const { streams } = await res.json();
+  assert.equal(streams[0].url, playlistUrl);
+});
+
+test('series: traduce id:temporada:episodio al endpoint /f/embed/tv', async () => {
+  const calls = mockFetch((url) => {
+    assert.equal(url, 'https://unlimplay.com/f/embed/tv/tt0903747/1/2');
+    return htmlResponse('<script>player.setup({file:"https://cdn.example.net/episode.m3u8"})</script>');
+  });
+
+  const res = await call('/stream/series/tt0903747:1:2.json');
+  const { streams } = await res.json();
+  assert.equal(streams.length, 1);
+  assert.equal(calls.length, 1);
+});
+
+test('series: también acepta tmdb id en segmentos y rechaza episodio incompleto', async () => {
+  const calls = mockFetch(() => htmlResponse('<script>player.setup({file:"https://cdn.example.net/episode.m3u8"})</script>'));
+  const res = await call('/stream/tv/1396/1/1.json');
+  assert.equal((await res.json()).streams.length, 1);
+  assert.equal(calls[0].url, 'https://unlimplay.com/f/embed/tv/1396/1/1');
+
+  const invalid = await call('/stream/series/tt0903747.json');
+  assert.deepEqual(await invalid.json(), { streams: [] });
+  assert.equal(invalid.headers.get('X-Proxy-Error'), 'bad-id');
+  assert.equal(calls.length, 1, 'no consulta el origen para un episodio incompleto');
+});
+
+test('deep scan no vuelve a solicitar la URL del propio Worker', async () => {
+  const calls = mockFetch((url) => {
+    if (url !== EMBED_URL) throw new Error(`bucle inesperado: ${url}`);
+    return htmlResponse(`<iframe src="${WORKER_URL}/stream/movie/tt1234567.json"></iframe>`);
+  });
+
+  const res = await call('/stream/movie/tt1234567.json');
+  assert.deepEqual(await res.json(), { streams: [] });
+  assert.equal(calls.length, 1);
+});
+
+test('deep scan conserva el diagnóstico si una página anidada devuelve 403', async () => {
+  mockFetch((url) => {
+    if (url === EMBED_URL) return htmlResponse('<iframe src="/player/config.php?id=x"></iframe>');
+    return new Response('Acceso denegado', { status: 403, statusText: 'Forbidden' });
+  });
+
+  const res = await call('/stream/movie/tt1234567.json');
+  assert.deepEqual(await res.json(), { streams: [] });
+  assert.equal(res.headers.get('X-Proxy-Error'), 'upstream');
+  assert.match(res.headers.get('X-Proxy-Detail'), /403/);
 });
 
 test('deep scan desactivado por env: no hace peticiones extra', async () => {
@@ -365,6 +470,7 @@ test('raíz con Accept: text/html → consola de pruebas en HTML', async () => {
   assert.match(html, /UnlimPlay Proxy Stream/);
   assert.ok(html.includes(`${WORKER_URL}/manifest.json`), 'debe mostrar la URL de instalación');
   assert.match(html, /<input id="mid"/);
+  assert.match(html, /X-Proxy-Detail/);
 });
 
 test('raíz con Accept: application/json → healthcheck JSON', async () => {

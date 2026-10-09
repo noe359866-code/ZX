@@ -20,8 +20,8 @@ enabled = true
 # "0" → devuelve la URL .m3u8 directa con behaviorHints.requestHeaders (default).
 PROXY_HLS = "0"
 
-# "1" → si el HTML del embed no trae el .m3u8, sigue los endpoints de
-# configuración del reproductor (máx. 2 peticiones extra).
+# "1" → si el HTML del embed no trae el .m3u8, sigue iframes/configuración
+# del reproductor (máximo 4 peticiones extra).
 DEEP_SCAN = "1"
 
 # Nº máximo de candidatos .m3u8 devueltos como streams alternativos.
@@ -30,6 +30,10 @@ MAX_STREAMS = "3"
 # "1" → marca el stream como no reproducible en navegador cuando depende de
 # cabeceras propias (Referer). En modo PROXY_HLS se ignora.
 NOT_WEB_READY = "1"
+
+# Rutas de embed documentadas para películas y episodios.
+EMBED_PATH = "/f/embed/movie/"
+TV_EMBED_PATH = "/f/embed/tv/"
 
 # Descomenta para fijar un dominio propio:
 # routes = [

@@ -24,7 +24,8 @@ Stremio ◀── {"streams":[{…behaviorHints…}]} ◀──┘
 | Método | Ruta | Descripción |
 | --- | --- | --- |
 | `GET` | `/manifest.json` | Manifiesto oficial del addon. |
-| `GET` | `/stream/movie/{id}.json` | Extrae y devuelve el `.m3u8` del embed. |
+| `GET` | `/stream/movie/{id}.json` | Extrae y devuelve el HLS de una película. |
+| `GET` | `/stream/series/{id}:{season}:{episode}.json` | Extrae el HLS de un episodio. |
 | `GET` | `/proxy?url=<URL>` | Pasarela HLS opcional (playlist + segmentos + claves). |
 | `GET` | `/` | Healthcheck JSON. Si el navegador envía `Accept: text/html`, sirve una consola de pruebas para resolver un id sin instalar Stremio. |
 | `OPTIONS` | cualquier ruta | Preflight CORS (`204` + cabeceras `Access-Control-*`). |
@@ -36,23 +37,24 @@ Todas las respuestas llevan `Access-Control-Allow-Origin: *`.
 ```json
 {
   "id": "com.cf.unlimplay.proxy",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "name": "UnlimPlay Proxy Stream",
   "description": "Addon proxy que resuelve flujos HLS (.m3u8) desde el embed de UnlimPlay en el edge de Cloudflare.",
   "logo": "https://unlimplay.com/favicon.ico",
   "background": "https://unlimplay.com/assets/images/background.jpg",
   "resources": ["stream"],
-  "types": ["movie"],
+  "types": ["movie", "series"],
   "idPrefixes": ["tt", "tmdb:"],
   "behaviorHints": { "configurable": false, "configurationRequired": false }
 }
 ```
 
-### `/stream/movie/{id}.json`
+### Streams de películas y series
 
-Acepta `tt1234567`, `tt1234567.json`, `tmdb:550`, `tmdb:movie:550`, `imdb:tt550`…
-El id se limpia (prefijos, `.json`, `%`-escapes, query) antes de construir
-`https://unlimplay.com/f/embed/movie/{id}`.
+Películas: acepta `tt1234567`, `tmdb:550`, `tmdb:movie:550`, `imdb:tt550`…
+Series: acepta el id de Stremio `tt0903747:1:2` (temporada 1, episodio 2), o
+`/stream/series/tt0903747/1/2.json`. Limpia prefijos, `.json` y escapes antes de
+construir `/f/embed/movie/{id}` o `/f/embed/tv/{id}/{temporada}/{episodio}`.
 
 Respuesta con stream encontrado:
 
@@ -90,7 +92,10 @@ Respuesta con stream encontrado:
 > `200 {"streams": []}`. Stremio simplemente no muestra el addon en lugar de romperse.
 > El motivo real viaja en las cabeceras de diagnóstico `X-Proxy-Error`
 > (`bad-id` · `not-found` · `upstream`) y `X-Proxy-Detail`, visibles con
-> `curl -D -` o en Workers Logs.
+> `curl -D -` o en Workers Logs. Si UnlimPlay responde `403` con `ERR_TOKEN_EXPIRED`,
+> el Worker no puede extraer el HLS de esa respuesta: hace falta que el origen permita
+> la solicitud o exponga un flujo de sesión/API documentado. El addon no ejecuta el
+> reproductor ni inventa/renueva tokens.
 
 Campos extra respecto al mínimo del enunciado y por qué están:
 
@@ -111,20 +116,23 @@ reproductores nunca entregan la URL en claro:
 | Truco del embed | Normalización |
 | --- | --- |
 | `https:\/\/cdn…\/master.m3u8` (JSON escapado) | `\/` → `/`, `\"` → `"` |
-| `\u002F`, `\x2F`, `&#47;`, `&#x2F;`, `&sol;` | → `/` |
-| `&amp;` en el token | → `&` |
+| `\uXXXX`, `\xXX`, `\/`, `&#47;`, `&#x2F;`, `&sol;` | se des-escapan, incluso con escapes anidados |
+| `&amp;`, `&period;`, `&colon;`, `&quest;`, `&equals;` | se normalizan en URL y token |
+| `%3A%2F%2F…%2Em3u8` (incluso doblemente codificado) | se explora una copia decodificada |
+| Base64 común (`atob`, valores de configuración) | se decodifica como texto, sin ejecutar JS |
 | `"https://cdn/x/" + "master.m3u8"` | se une en una segunda pasada *flat* |
 
-Después se aplican **cuatro patrones ordenados por confianza**:
+Después se aplican **cinco patrones ordenados por confianza**:
 
-1. **Clave de reproductor** (peso 100) — `file|src|source|url|hlsUrl|videoUrl|playUrl|streamUrl|playlist|manifest|m3u8|link|media|path` seguido de `:` o `=` y una URL entrecomillada. Cubre JWPlayer, Plyr, Video.js, Clappr y hls.js.
-2. **Literal entrecomillado** (peso 60) — cualquier `"…​.m3u8…"` suelto en el documento.
-3. **URL desnuda** (peso 30) — sin comillas, con *lookahead* de delimitador para no recortar rutas mayores (`…/a.m3u8backup/file.bin` no produce un falso `…/a.m3u8`) y con *lookbehind* `(?<!:)` para no robar las barras de `ftp://` o `rtsp://`.
-4. **Recombinación** (peso 45, último recurso) — si no apareció ninguna URL absoluta, se combinan los fragmentos `*.m3u8` relativos con los prefijos base `"https://…/"` del propio documento, que es justo lo que hace el JS del reproductor al concatenar variables.
+1. **Clave de reproductor** (peso 100) — `file|src|source|url|hlsUrl|videoUrl|playUrl|streamUrl|playlist|manifest|m3u8|link|media|path` seguido de `:` o `=` y una URL absoluta. Cubre JWPlayer, Plyr, Video.js, Clappr y hls.js.
+2. **Fuente relativa explícita** (peso 80) — rutas como `src="/hls/master.m3u8"`, absolutizadas contra la URL final del documento.
+3. **Literal entrecomillado** (peso 60) — cualquier URL absoluta `"…​.m3u8…"` suelta en el documento.
+4. **URL desnuda** (peso 30) — sin comillas, con *lookahead* de delimitador para no recortar rutas mayores (`…/a.m3u8backup/file.bin` no produce un falso `…/a.m3u8`) y con *lookbehind* `(?<!:)` para no robar las barras de `ftp://` o `rtsp://`.
+5. **Recombinación** (peso 45, último recurso) — si no apareció ninguna URL absoluta, se combinan los fragmentos `*.m3u8` relativos con los prefijos base `"https://…/"` del propio documento, que es justo lo que hace el JS del reproductor al concatenar variables.
 
-Cada candidato se **absolutiza** (relativas y `//protocol-relative` contra la URL del
-embed), se **valida** (`pathname` terminado en `.m3u8`, sólo `http`/`https`, host con
-punto), se **deduplica** y se **puntúa**:
+Cada candidato se **absolutiza** (relativas y `//protocol-relative` contra la URL final
+del documento), se **valida** (ruta terminada en `.m3u8`, incluso codificada, sólo
+`http`/`https`, host con punto), se **deduplica** y se **puntúa**:
 
 - `+5` si el host es un CDN distinto del host del embed,
 - `+3` si la ruta contiene `master|index|playlist|chunklist|manifest`,
@@ -136,11 +144,14 @@ primeros: el primero con el título `UnlimPlay 1080p [HLS Edge]` y los siguiente
 
 ### Deep scan (fallback)
 
-Muchos embeds **no** traen el `.m3u8` en el HTML: el reproductor lo pide por XHR a un
-endpoint de configuración. Si la extracción directa no encuentra nada y `DEEP_SCAN=1`
-(por defecto), el Worker busca en el HTML URLs tipo `/api/…`, `…/source…`,
-`…/player…`, `*.json`, `*.php?…` (descartando estáticos `.js/.css/.png/…`), consulta
-**como máximo 2** de ellas y vuelve a aplicar los cuatro patrones sobre la respuesta.
+Muchos embeds **no** traen el `.m3u8` en el HTML: el reproductor puede vivir en un
+iframe anidado, un JS específico o un endpoint XHR/JSON. Si la extracción directa no
+encuentra nada y `DEEP_SCAN=1` (por defecto), el Worker prioriza referencias a
+`iframe`, scripts de player y rutas `/api/…`, `/embed/…`, `/player/…`, `*.json` o
+`*.php`; descarta imágenes, estilos, fuentes y segmentos. Sigue recursivamente
+**hasta 4 referencias** y vuelve a extraer en cada respuesta. Los redirects se siguen
+y sus URLs finales se usan como base al resolver fuentes relativas. El análisis es
+estático: no ejecuta JavaScript ni crea/renueva tokens de sesión.
 
 ### Páginas enormes
 
@@ -159,7 +170,8 @@ HTML y hls.js al final, así que ningún corte deja fuera el `.m3u8`.
 | `MAX_STREAMS` | `"3"` | Nº de candidatos `.m3u8` devueltos como streams. |
 | `NOT_WEB_READY` | `"1"` | `"0"` muestra el stream también en Stremio Web aunque dependa de cabeceras. Se ignora con `PROXY_HLS=1`. |
 | `SOURCE_ORIGIN` | `https://unlimplay.com` | Origen del embed. Estos dominios rotan: se cambia sin redesplegar código. |
-| `EMBED_PATH` | `/f/embed/movie/` | Ruta del reproductor embebido. |
+| `EMBED_PATH` | `/f/embed/movie/` | Ruta del reproductor de películas. |
+| `TV_EMBED_PATH` | `/f/embed/tv/` | Ruta del reproductor de episodios. |
 
 ---
 
@@ -194,7 +206,7 @@ propio, descomenta el bloque `routes`.
 ## 5. Desarrollo y pruebas locales
 
 ```bash
-npm test                     # 58 tests (node:test, sin red)
+npm test                     # 70 tests (node:test, sin red)
 
 # Terminal 1: origen de vídeo de pega (embed + CDN, exige Referer)
 npm run mock                 # http://0.0.0.0:8788
@@ -217,25 +229,23 @@ curl -s localhost:8787/stream/movie/tt1234567.json | jq          # JWPlayer esca
 curl -s localhost:8787/stream/movie/tt9999999.json | jq          # deep scan
 curl -s localhost:8787/stream/movie/tt0000000.json               # {"streams":[]}
 curl -s localhost:8787/stream/movie/tmdb:movie:550.json | jq     # limpieza de prefijos
+curl -s localhost:8787/stream/series/tt0903747:1:2.json | jq    # episodio T1 E2
 curl -s "localhost:8787/proxy?url=$(python3 -c "import urllib.parse;print(urllib.parse.quote('http://127.0.0.1:8788/hls/tt1234567/master.m3u8',safe=''))")"
 ```
 
 ### Cobertura de los tests
 
 `test/extract.test.mjs` — lógica pura: `cleanId`, `normalizeSource`, `absolutize`,
-`extractM3u8Urls` (JWPlayer, Plyr, Video.js, hls.js, JSON minificado, entidades HTML,
-URLs sin comillas, concatenaciones, deduplicación, orden por confianza, falsos
-positivos, protocolos raros), `findConfigUrls`, `rewritePlaylist`, `truncateSmart`,
-`resolveSource`, `buildManifest` y `healthHtml`.
+`extractM3u8Urls` (JWPlayer, Plyr, Video.js, hls.js, JSON, rutas relativas, escapes
+Unicode/HTML, percent-encoding, Base64, concatenaciones, deduplicación, falsos
+positivos y protocolos raros), `findConfigUrls` (iframes/scripts y filtro SSRF),
+`rewritePlaylist`, `truncateSmart`, `resolveSource` y `buildManifest`.
 
-`test/router.test.mjs` — integración con `fetch()` mockeado (sin red): preflight CORS,
-cabeceras en todas las rutas, 404/405, healthcheck, contrato del manifiesto, forma
-exacta del objeto `stream` y de `behaviorHints`, limpieza del id, id inválido, HTML sin
-`.m3u8`, origen 500, excepción de red, deep scan activado/desactivado, varios
-candidatos, `MAX_STREAMS`, `PROXY_HLS=1`, reescritura de playlists, segmentos con
-`Range`/`206`, validación del parámetro `url`, bloqueo de bucles de proxy, 502 del CDN,
-negociación de contenido en `/` (HTML vs JSON), `SOURCE_ORIGIN` por env y dos regresiones
-(cabeceras con caracteres no Latin-1 y mayúsculas del id al enrutar).
+`test/router.test.mjs` — integración con `fetch()` mockeado (sin red): contrato Stremio
+para películas y episodios, redirects y URLs relativas, extracción desde playlist
+redirigido, recorrido acotado de iframes/API, diagnóstico de 403, fallos del origen,
+`MAX_STREAMS`, `PROXY_HLS=1`, reescritura de playlists, segmentos con `Range`/`206`,
+validación del parámetro `url`, bloqueo de bucles de proxy, healthcheck y cabeceras CORS.
 
 ---
 
@@ -254,9 +264,9 @@ negociación de contenido en `/` (HTML vs JSON), `SOURCE_ORIGIN` por env y dos r
   Worker (bucle).
 - **Sin secretos**: no hay claves API ni tokens en el código, así que no se necesita
   `.dev.vars`.
-- **Coste**: 1 subrequest por stream (3 como máximo con deep scan) y, en modo proxy,
-  1 subrequest por playlist/segmento. Dentro del plan gratuito de Workers conviene
-  vigilar el número de subrequests si el addon se comparte.
+- **Coste**: 1 subrequest para el embed y hasta 4 solicitudes relacionadas con
+  `DEEP_SCAN=1` (5 como máximo para resolver un stream); en modo proxy se suma 1 por
+  playlist/segmento. El deep scan es acotado y conviene vigilar las cuotas si se comparte.
 
 ---
 
