@@ -3,15 +3,17 @@
  *  tools/mock-origin.mjs — Origen de vídeo de pega para pruebas locales
  * ============================================================================
  *
- *  Simula el embed de UnlimPlay + su CDN para poder probar el Worker de punta
- *  a punta sin tocar la red real. NO se despliega: es sólo harness de desarrollo.
+ *  Simula los embeds de Vimeus y UnlimPlay + su CDN para probar el Worker de
+ *  punta a punta sin tocar la red real. NO se despliega: sólo desarrollo.
  *
  *  Uso:
  *    node tools/mock-origin.mjs            # escucha en 0.0.0.0:8788
  *    PORT=9000 node tools/mock-origin.mjs
  *
  *  Rutas:
- *    GET /f/embed/movie/tt1234567   → HTML con JWPlayer y la URL escapada (\/)
+ *    GET /e/movie?imdb=tt1234567&view_key=local-test-key → mock Vimeus, HLS directo
+ *    GET /e/serie|/e/anime?...                        → mock Vimeus para episodios
+ *    GET /f/embed/movie/tt1234567                     → fallback UnlimPlay
  *    GET /f/embed/movie/tt9999999   → HTML con deep-scan: el .m3u8 viene de /api
  *    GET /api/source/tt9999999      → JSON con la URL del stream
  *    GET /f/embed/movie/tt0000000   → HTML sin ningún .m3u8
@@ -88,6 +90,20 @@ const deepScanApi = (req) =>
 /** Escenario 3 — página sin stream (debe producir {"streams": []}). */
 const embedEmpty = () => `<!doctype html><html><body><p>Contenido no disponible</p></body></html>`;
 
+/** Mock del embed Vimeus; requiere la clave de prueba local, no una clave real. */
+const VIMEUS_MOCK_VIEW_KEY = 'local-test-key';
+const embedVimeus = (req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  if (url.searchParams.get('view_key') !== VIMEUS_MOCK_VIEW_KEY) {
+    return send(res, 401, 'view_key de desarrollo no válida', 'text/plain; charset=utf-8');
+  }
+
+  const id = url.searchParams.get('imdb') || url.searchParams.get('tmdb');
+  if (id === 'tt0000000' || id === '0') return send(res, 200, embedEmpty());
+  if (id === 'tt9999999') return send(res, 200, embedDeepScan(req));
+  return send(res, 200, embedJwplayer(req));
+};
+
 const masterPlaylist = (req, id) => `#EXTM3U
 #EXT-X-VERSION:3
 #EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080,CODECS="avc1.640028,mp4a.40.2"
@@ -116,6 +132,9 @@ const server = createServer((req, res) => {
   const path = url.pathname;
 
   // --- Embeds -------------------------------------------------------------
+  if (path === '/e/movie' || path === '/e/serie' || path === '/e/anime') {
+    return embedVimeus(req, res);
+  }
   if (path === '/f/embed/movie/tt1234567') return send(res, 200, embedJwplayer(req));
   if (path === '/f/embed/movie/tt9999999') return send(res, 200, embedDeepScan(req));
   if (path === '/f/embed/movie/tt0000000') return send(res, 200, embedEmpty());
@@ -177,7 +196,8 @@ const server = createServer((req, res) => {
 
 server.listen(PORT, HOST, () => {
   console.log(`[mock-origin] escuchando en http://${HOST}:${PORT}`);
-  console.log(`[mock-origin] embed OK      → http://${HOST}:${PORT}/f/embed/movie/tt1234567`);
+  console.log(`[mock-origin] Vimeus mock  → http://${HOST}:${PORT}/e/movie?imdb=tt1234567&view_key=${VIMEUS_MOCK_VIEW_KEY}`);
+  console.log(`[mock-origin] embed fallback → http://${HOST}:${PORT}/f/embed/movie/tt1234567`);
   console.log(`[mock-origin] embed deep    → http://${HOST}:${PORT}/f/embed/movie/tt9999999`);
   console.log(`[mock-origin] embed vacío   → http://${HOST}:${PORT}/f/embed/movie/tt0000000`);
 });

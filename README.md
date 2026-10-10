@@ -1,295 +1,160 @@
-# UnlimPlay Proxy Stream — Addon de Stremio en Cloudflare Workers
+# Vimeus + UnlimPlay HLS — Addon de Stremio en Cloudflare Workers
 
-Worker (formato **ES Module**) que actúa como *addon proxy* de Stremio: resuelve el
-flujo **HLS (`.m3u8`)** que sirve el reproductor embebido de UnlimPlay, haciendo el
-scraping **desde el edge de Cloudflare** y devolviendo la respuesta en el formato
-exacto del protocolo de addons de Stremio.
+Worker ES Module que resuelve una URL HLS (`.m3u8`) para Stremio. **Vimeus es el proveedor principal; UnlimPlay se consulta únicamente si Vimeus no está configurado, falla o no devuelve un HLS.** El Worker entrega a Stremio el enlace HLS encontrado, con las cabeceras necesarias; opcionalmente puede retransmitir la playlist y sus segmentos mediante `/proxy`.
 
-```
-Stremio ──▶ /stream/movie/tt1234567.json ──▶ Worker (edge)
-                                               │  fetch() con UA + Referer de navegador
-                                               ▼
-                                    https://unlimplay.com/f/embed/movie/tt1234567
-                                               │  HTML/JS del reproductor
-                                               ▼
-                                    regex → https://cdn…/master.m3u8?token=…
-                                               │
-Stremio ◀── {"streams":[{…behaviorHints…}]} ◀──┘
+```text
+Stremio ──▶ /stream/movie/tt1234567.json ──▶ Worker
+                                                   │  1. Vimeus /e/movie?...&view_key=...
+                                                   │     extrae HLS si está disponible
+                                                   │  2. si no hay HLS → UnlimPlay /f/embed/movie/tt1234567
+                                                   ▼
+                                           { streams: [{ type: "hls", url: "…m3u8" }] }
 ```
 
----
+> Configura una `VIMEUS_VIEW_KEY` autorizada como secreto del Worker. Si falta, Vimeus se omite y se intenta UnlimPlay. El resolver sólo analiza respuestas HTTP normales: no ejecuta JavaScript, no crea cookies y no inventa ni renueva tokens.
 
-## 1. Endpoints
+## Endpoints
 
 | Método | Ruta | Descripción |
 | --- | --- | --- |
-| `GET` | `/manifest.json` | Manifiesto oficial del addon. |
-| `GET` | `/stream/movie/{id}.json` | Extrae y devuelve el HLS de una película. |
-| `GET` | `/stream/series/{id}:{season}:{episode}.json` | Extrae el HLS de un episodio. |
-| `GET` | `/proxy?url=<URL>` | Pasarela HLS opcional (playlist + segmentos + claves). |
-| `GET` | `/` | Healthcheck JSON. Si el navegador envía `Accept: text/html`, sirve una consola de pruebas para resolver un id sin instalar Stremio. |
-| `OPTIONS` | cualquier ruta | Preflight CORS (`204` + cabeceras `Access-Control-*`). |
+| `GET` | `/manifest.json` | Manifiesto de Stremio. |
+| `GET` | `/stream/movie/{id}.json` | Resuelve una película y devuelve el HLS. |
+| `GET` | `/stream/series/{id}:{season}:{episode}.json` | Resuelve un episodio. |
+| `GET` | `/proxy?url=<URL>&provider=<vimeus\|unlimplay>` | Pasarela HLS opcional para playlists, variantes y segmentos. |
+| `GET` | `/` | Healthcheck JSON; con `Accept: text/html`, consola de prueba. |
+| `OPTIONS` | cualquier ruta | Preflight CORS. |
 
-Todas las respuestas llevan `Access-Control-Allow-Origin: *`.
+Las respuestas del addon incluyen CORS. Cuando hay un stream, `X-Stream-Provider` dice qué proveedor lo entregó y `X-Provider-Attempts` resume la cascada sin revelar la clave.
 
-### `/manifest.json`
+## Orden y formato de los proveedores
 
-```json
-{
-  "id": "com.cf.unlimplay.proxy",
-  "version": "1.1.0",
-  "name": "UnlimPlay Proxy Stream",
-  "description": "Addon proxy que resuelve flujos HLS (.m3u8) desde el embed de UnlimPlay en el edge de Cloudflare.",
-  "logo": "https://unlimplay.com/favicon.ico",
-  "background": "https://unlimplay.com/assets/images/background.jpg",
-  "resources": ["stream"],
-  "types": ["movie", "series"],
-  "idPrefixes": ["tt", "tmdb:"],
-  "behaviorHints": { "configurable": false, "configurationRequired": false }
-}
-```
+El orden predeterminado es `vimeus,unlimplay` y se puede cambiar con `PROVIDER_ORDER`.
 
-### Streams de películas y series
+1. **Vimeus**: películas en `/e/movie`; series primero en `/e/serie` y, si no se encuentra HLS, se prueba `/e/anime`. El ID `tt…` se envía como `imdb`; un ID numérico, como `tmdb`. En todos los casos se añade `view_key`; para series también `se` y `ep`.
+2. **UnlimPlay (respaldo)**: películas en `/f/embed/movie/{id}` y episodios en `/f/embed/tv/{id}/{season}/{episode}`.
 
-Películas: acepta `tt1234567`, `tmdb:550`, `tmdb:movie:550`, `imdb:tt550`…
-Series: acepta el id de Stremio `tt0903747:1:2` (temporada 1, episodio 2), o
-`/stream/series/tt0903747/1/2.json`. Limpia prefijos, `.json` y escapes antes de
-construir `/f/embed/movie/{id}` o `/f/embed/tv/{id}/{temporada}/{episodio}`.
+Se pasa al proveedor siguiente cuando el anterior responde con error, no publica un `.m3u8` que el extractor reconozca, la clave no está configurada o la playlist no valida (`HTTP` no exitoso o cuerpo sin `#EXTM3U`, con `VERIFY_HLS=1`). Si Vimeus encuentra y valida HLS, UnlimPlay no se consulta.
 
-Respuesta con stream encontrado:
+El ID de Stremio puede ser `tt1234567`, `tmdb:550`, `tmdb:movie:550` o, para una serie, `tt0903747:1:2`. El Worker limpia prefijos/escapes y valida temporada y episodio antes de construir las URLs.
+
+Ejemplo de respuesta:
 
 ```json
 {
   "streams": [
     {
-      "name": "UnlimPlay Proxy Stream",
-      "title": "UnlimPlay 1080p [HLS Edge]",
+      "name": "Vimeus + UnlimPlay HLS",
+      "title": "Vimeus [HLS]",
       "type": "hls",
-      "url": "https://cdn…/hls/tt1234567/master.m3u8?token=abc123",
+      "url": "https://cdn.example/master.m3u8?token=…",
       "behaviorHints": {
         "notSupported": false,
         "notWebReady": true,
         "requestHeaders": {
-          "Referer": "https://unlimplay.com/",
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+          "Referer": "https://vimeus.com/",
+          "User-Agent": "Mozilla/5.0 …"
         },
         "proxyHeaders": {
           "request": {
-            "Referer": "https://unlimplay.com/",
+            "Referer": "https://vimeus.com/",
             "User-Agent": "Mozilla/5.0 …",
-            "Origin": "https://unlimplay.com"
+            "Origin": "https://vimeus.com"
           }
         },
-        "bingeGroup": "unlimplay-0"
+        "bingeGroup": "vimeus-0"
       }
     }
   ]
 }
 ```
 
-> **Nunca falla.** Si el id es inválido, el origen responde 4xx/5xx, la red se cae,
-> se agota el timeout o no hay ningún `.m3u8` en el HTML, el Worker devuelve
-> `200 {"streams": []}`. Stremio simplemente no muestra el addon en lugar de romperse.
-> El motivo real viaja en las cabeceras de diagnóstico `X-Proxy-Error`
-> (`bad-id` · `not-found` · `upstream`) y `X-Proxy-Detail`, visibles con
-> `curl -D -` o en Workers Logs. Si UnlimPlay responde `403` con `ERR_TOKEN_EXPIRED`,
-> el Worker no puede extraer el HLS de esa respuesta: hace falta que el origen permita
-> la solicitud o exponga un flujo de sesión/API documentado. El addon no ejecuta el
-> reproductor ni inventa/renueva tokens.
+En modo proxy, el enlace que se entrega a Stremio lleva el proveedor en el parámetro `provider`; el Worker lo conserva al reescribir las playlists para aplicar el `Referer` correcto a variantes y segmentos. `PROXY_HLS=1` es útil para clientes que no pueden inyectar cabeceras, incluido Stremio Web.
 
-Campos extra respecto al mínimo del enunciado y por qué están:
+Si todos los intentos fallan, se devuelve `200 {"streams": []}` para no romper Stremio. Los detalles van en `X-Proxy-Error`, `X-Proxy-Detail` y `X-Provider-Attempts`. Las claves `view_key` y los tokens se eliminan de los diagnósticos.
 
-| Campo | Motivo |
-| --- | --- |
-| `behaviorHints.proxyHeaders` | Formato moderno de Stremio (≥ 1.6) para inyectar cabeceras; `requestHeaders` se mantiene por compatibilidad. |
-| `behaviorHints.notWebReady` | En modo directo el stream necesita `Referer`, que un navegador no puede enviar. Se ignora en modo `PROXY_HLS`. |
-| `behaviorHints.bingeGroup` | Agrupa las variantes del mismo título en la UI de Stremio. |
-| `name` | Etiqueta el origen del stream en el selector de Stremio. |
+## Extracción HLS
 
----
+El extractor normaliza el HTML/JS estático antes de aplicar patrones. Reconoce, entre otros casos:
 
-## 2. Cómo se extrae el `.m3u8`
+- URLs JSON escapadas (`https:\/\/…`), escapes Unicode/hex y entidades HTML.
+- URLs codificadas en porcentaje, incluso con doble codificación, y payloads Base64 comunes.
+- Configuraciones de reproductores (`file`, `src`, `source`, `hlsUrl`, `playlist`, etc.), rutas relativas, URLs entrecomilladas y URLs construidas por concatenación.
+- Redirecciones, playlists directas y referencias a iframes/configuración mediante un deep scan limitado.
 
-El HTML/JS del embed se **normaliza** antes de aplicar las regex, porque estos
-reproductores nunca entregan la URL en claro:
+Los candidatos se absolutizan, validan como URLs HTTP(S) con ruta `.m3u8`, deduplican y ordenan. El análisis es estático: **no se ejecuta el player ni se eluden controles de acceso**. Un HLS que requiere sesión, DRM o tokens no expuestos no se puede resolver con este mecanismo.
 
-| Truco del embed | Normalización |
-| --- | --- |
-| `https:\/\/cdn…\/master.m3u8` (JSON escapado) | `\/` → `/`, `\"` → `"` |
-| `\uXXXX`, `\xXX`, `\/`, `&#47;`, `&#x2F;`, `&sol;` | se des-escapan, incluso con escapes anidados |
-| `&amp;`, `&period;`, `&colon;`, `&quest;`, `&equals;` | se normalizan en URL y token |
-| `%3A%2F%2F…%2Em3u8` (incluso doblemente codificado) | se explora una copia decodificada |
-| Base64 común (`atob`, valores de configuración) | se decodifica como texto, sin ejecutar JS |
-| `"https://cdn/x/" + "master.m3u8"` | se une en una segunda pasada *flat* |
+`PROXY_HLS=1` hace que `/proxy` retransmita el manifiesto y los segmentos con `Range`, CORS y cabeceras del proveedor. La URL de destino debe ser HTTP(S) y no puede apuntar al propio Worker.
 
-Después se aplican **cinco patrones ordenados por confianza**:
+## Variables y secretos
 
-1. **Clave de reproductor** (peso 100) — `file|src|source|url|hlsUrl|videoUrl|playUrl|streamUrl|playlist|manifest|m3u8|link|media|path` seguido de `:` o `=` y una URL absoluta. Cubre JWPlayer, Plyr, Video.js, Clappr y hls.js.
-2. **Fuente relativa explícita** (peso 80) — rutas como `src="/hls/master.m3u8"`, absolutizadas contra la URL final del documento.
-3. **Literal entrecomillado** (peso 60) — cualquier URL absoluta `"…​.m3u8…"` suelta en el documento.
-4. **URL desnuda** (peso 30) — sin comillas, con *lookahead* de delimitador para no recortar rutas mayores (`…/a.m3u8backup/file.bin` no produce un falso `…/a.m3u8`) y con *lookbehind* `(?<!:)` para no robar las barras de `ftp://` o `rtsp://`.
-5. **Recombinación** (peso 45, último recurso) — si no apareció ninguna URL absoluta, se combinan los fragmentos `*.m3u8` relativos con los prefijos base `"https://…/"` del propio documento, que es justo lo que hace el JS del reproductor al concatenar variables.
-
-Cada candidato se **absolutiza** (relativas y `//protocol-relative` contra la URL final
-del documento), se **valida** (ruta terminada en `.m3u8`, incluso codificada, sólo
-`http`/`https`, host con punto), se **deduplica** y se **puntúa**:
-
-- `+5` si el host es un CDN distinto del host del embed,
-- `+3` si la ruta contiene `master|index|playlist|chunklist|manifest`,
-- `+2` si la query lleva `token|sign|signature|hash|expire|key|auth`.
-
-El resultado se ordena de mayor a menor confianza y se devuelven los `MAX_STREAMS`
-primeros: el primero con el título `UnlimPlay 1080p [HLS Edge]` y los siguientes como
-`… · Alt 2`, `… · Alt 3`.
-
-### Deep scan (fallback)
-
-Muchos embeds **no** traen el `.m3u8` en el HTML: el reproductor puede vivir en un
-iframe anidado, un JS específico o un endpoint XHR/JSON. Si la extracción directa no
-encuentra nada y `DEEP_SCAN=1` (por defecto), el Worker prioriza referencias a
-`iframe`, scripts de player y rutas `/api/…`, `/embed/…`, `/player/…`, `*.json` o
-`*.php`; descarta imágenes, estilos, fuentes y segmentos. Sigue recursivamente
-**hasta 4 referencias** y vuelve a extraer en cada respuesta. Los redirects se siguen
-y sus URLs finales se usan como base al resolver fuentes relativas. El análisis es
-estático: no ejecuta JavaScript ni crea/renueva tokens de sesión.
-
-### Páginas enormes
-
-`truncateSmart()` conserva **cabeza y cola** del documento (1,5 M de caracteres cada
-una) en vez de recortar sólo por el principio: JWPlayer se configura al inicio del
-HTML y hls.js al final, así que ningún corte deja fuera el `.m3u8`.
-
----
-
-## 3. Variables de entorno
-
-| Variable | Por defecto | Efecto |
+| Variable | Valor por defecto | Efecto |
 | --- | --- | --- |
-| `PROXY_HLS` | `"0"` | `"1"` → la URL del stream apunta a `/proxy?url=…` y el Worker inyecta él las cabeceras. Necesario para Stremio Web y para CDNs que bloquean peticiones sin `Referer`. |
-| `DEEP_SCAN` | `"1"` | `"0"` desactiva las peticiones extra a endpoints de configuración. |
-| `MAX_STREAMS` | `"3"` | Nº de candidatos `.m3u8` devueltos como streams. |
-| `NOT_WEB_READY` | `"1"` | `"0"` muestra el stream también en Stremio Web aunque dependa de cabeceras. Se ignora con `PROXY_HLS=1`. |
-| `SOURCE_ORIGIN` | `https://unlimplay.com` | Origen del embed. Estos dominios rotan: se cambia sin redesplegar código. |
-| `EMBED_PATH` | `/f/embed/movie/` | Ruta del reproductor de películas. |
-| `TV_EMBED_PATH` | `/f/embed/tv/` | Ruta del reproductor de episodios. |
+| `PROVIDER_ORDER` | `vimeus,unlimplay` | Orden de intento. Ej.: `unlimplay,vimeus`. |
+| `VIMEUS_ORIGIN` | `https://vimeus.com` | Origen de Vimeus. |
+| `VIMEUS_VIEW_KEY` | — | Clave para el embed de Vimeus. **Configúrala como secreto; no la guardes en Git ni la compartas en el chat.** |
+| `VIMEUS_REFERER` | `https://vimeus.com/` | Referer enviado al pedir/reproducir el HLS. Si tu `view_key` tiene una lista de dominios permitidos, configúralo con el origen autorizado por Vimeus. |
+| `VIMEUS_MOVIE_PATH` | `/e/movie` | Ruta de película en Vimeus. |
+| `VIMEUS_SERIES_PATHS` | `/e/serie,/e/anime` | Rutas probadas para series/anime, en ese orden. |
+| `VIEW_KEY` | — | Alias heredado de `VIMEUS_VIEW_KEY`. |
+| `UNLIMPLAY_ORIGIN` | `https://unlimplay.com` | Origen de respaldo UnlimPlay. |
+| `SOURCE_ORIGIN` | — | Alias heredado de `UNLIMPLAY_ORIGIN`; útil en el mock local. |
+| `EMBED_PATH` | `/f/embed/movie/` | Ruta de películas UnlimPlay. |
+| `TV_EMBED_PATH` | `/f/embed/tv/` | Ruta de episodios UnlimPlay. |
+| `PROXY_HLS` | `0` | `1` → devolver HLS a través del proxy del Worker. |
+| `DEEP_SCAN` | `1` | `0` → no seguir referencias estáticas a iframes/configuración. |
+| `MAX_STREAMS` | `3` | Máximo de playlists alternativas del proveedor que tuvo éxito. |
+| `VERIFY_HLS` | `1` | Solicita cada candidato y exige una respuesta HLS `#EXTM3U`; si no valida, prueba el proveedor de respaldo. Usa `0` para desactivar la verificación. |
+| `NOT_WEB_READY` | `1` | En modo directo, marca el stream como no listo para navegador cuando requiere cabeceras. Se ignora con `PROXY_HLS=1`. |
 
----
+## Despliegue en Cloudflare
 
-## 4. Despliegue
+1. Despliega el Worker con Wrangler o desde el panel de Cloudflare.
+2. En producción, configura la clave **sin ponerla en `wrangler.toml`**:
 
-### Opción A — Panel de Cloudflare (copiar y pegar)
+   ```bash
+   npx wrangler secret put VIMEUS_VIEW_KEY
+   ```
 
-1. Cloudflare Dashboard → **Workers & Pages** → **Create** → **Worker**.
-2. **Edit code** → borra el contenido de `worker.js` → pega **`src/index.js`** entero.
-3. **Deploy**.
-4. (Opcional) **Settings → Variables and Secrets** → añade las variables de la tabla
-   anterior como *Text*.
-5. Instala en Stremio: **`https://TU-WORKER.workers.dev/manifest.json`**
-   (o directamente la URL `stremio://` que genera la app).
+3. Si la clave está restringida por dominio, configura `VIMEUS_REFERER` con el origen autorizado. El Worker no evade una lista de dominios: si Vimeus rechaza la solicitud, el intento continúa con UnlimPlay.
+4. Instala en Stremio: `https://TU-WORKER.workers.dev/manifest.json`.
 
-El fichero es autocontenido: no importa dependencias ni usa bindings, así que funciona
-tal cual en el editor del panel.
+`wrangler.toml` deja el orden en `vimeus,unlimplay`. Para un dominio propio, configura la ruta `routes` ahí según Cloudflare.
 
-### Opción B — Wrangler (recomendado, con control de versiones)
-
-```bash
-npm install          # instala wrangler
-npm run deploy       # wrangler deploy  → usa wrangler.toml
-```
-
-`wrangler.toml` ya declara `name`, `main = "src/index.js"`, `compatibility_date`,
-`nodejs_compat`, observabilidad activada y las `[vars]` por defecto. Para un dominio
-propio, descomenta el bloque `routes`.
-
----
-
-## 5. Desarrollo y pruebas locales
+## Desarrollo y pruebas locales
 
 ```bash
-npm test                     # 70 tests (node:test, sin red)
+npm test                     # pruebas unitarias y del router, sin red
 
-# Terminal 1: origen de vídeo de pega (embed + CDN, exige Referer)
+# Terminal 1: origen mock (Vimeus + UnlimPlay + CDN de prueba)
 npm run mock                 # http://0.0.0.0:8788
 
-# Terminal 2: Worker en local apuntando al origen de pega
-npm run dev:local            # http://0.0.0.0:8787
-npm run tail                 # logs en producción
+# Terminal 2: prueba Vimeus principal y fallback local
+npm run dev:vimeus:local     # http://0.0.0.0:8787
+
+# Alternativa: probar sólo el fallback UnlimPlay
+npm run dev:local
 ```
 
-`tools/mock-origin.mjs` reproduce tres escenarios reales — JWPlayer con la URL escapada
-(`\/`), deep scan contra `/api/source/{id}` y una página sin stream — y **devuelve 403
-si la petición no trae `Referer`**, lo que permite comprobar de verdad que el Worker y
-la pasarela HLS inyectan las cabeceras.
+El mock sólo acepta la clave de desarrollo `local-test-key`; no es una clave real ni debe usarse en producción. Reproduce respuestas HLS directas, deep scan, páginas sin stream, playlists, segmentos `Range` y solicitudes sin `Referer`.
 
-Verificación manual:
+Ejemplos con el Worker local:
 
 ```bash
 curl -s localhost:8787/manifest.json | jq
-curl -s localhost:8787/stream/movie/tt1234567.json | jq          # JWPlayer escapado
-curl -s localhost:8787/stream/movie/tt9999999.json | jq          # deep scan
-curl -s localhost:8787/stream/movie/tt0000000.json               # {"streams":[]}
-curl -s localhost:8787/stream/movie/tmdb:movie:550.json | jq     # limpieza de prefijos
-curl -s localhost:8787/stream/series/tt0903747:1:2.json | jq    # episodio T1 E2
-curl -s "localhost:8787/proxy?url=$(python3 -c "import urllib.parse;print(urllib.parse.quote('http://127.0.0.1:8788/hls/tt1234567/master.m3u8',safe=''))")"
+curl -s localhost:8787/stream/movie/tt1234567.json | jq
+curl -s localhost:8787/stream/movie/tt0000000.json -D -  # HLS ausente → respaldo/diagnóstico
+curl -s localhost:8787/stream/series/tt0903747:1:2.json | jq
 ```
 
-### Cobertura de los tests
+Las pruebas mockeadas cubren orden Vimeus→UnlimPlay, `view_key` ausente/incorrecta, extracción de URLs, fallos 4xx/5xx, series/anime, cabeceras por proveedor, proxy de playlists/segmentos, CORS y saneamiento de diagnósticos. No demuestran disponibilidad real de los proveedores: la reproducción real debe verificarse con una clave y contenido autorizados.
 
-`test/extract.test.mjs` — lógica pura: `cleanId`, `normalizeSource`, `absolutize`,
-`extractM3u8Urls` (JWPlayer, Plyr, Video.js, hls.js, JSON, rutas relativas, escapes
-Unicode/HTML, percent-encoding, Base64, concatenaciones, deduplicación, falsos
-positivos y protocolos raros), `findConfigUrls` (iframes/scripts y filtro SSRF),
-`rewritePlaylist`, `truncateSmart`, `resolveSource` y `buildManifest`.
+## Notas
 
-`test/router.test.mjs` — integración con `fetch()` mockeado (sin red): contrato Stremio
-para películas y episodios, redirects y URLs relativas, extracción desde playlist
-redirigido, recorrido acotado de iframes/API, diagnóstico de 403, fallos del origen,
-`MAX_STREAMS`, `PROXY_HLS=1`, reescritura de playlists, segmentos con `Range`/`206`,
-validación del parámetro `url`, bloqueo de bucles de proxy, healthcheck y cabeceras CORS.
+- Timeout de 9 s por solicitud de origen; el deep scan está acotado a cuatro referencias por proveedor.
+- El Worker conserva las rutas originales de Stremio y el ID de manifiesto para no obligar a reinstalar el addon.
+- `X-Proxy-Detail` se limita y sanea; las claves y tokens no se exponen en esos diagnósticos.
+- Respeta los términos de cada proveedor y usa únicamente fuentes/contenidos para los que tengas autorización. Este addon no aloja ni distribuye archivos multimedia.
 
----
+## Licencia
 
-## 6. Notas de implementación
-
-- **`Request.cf` / `cf:` no se usa a propósito**: mantiene el Worker portable y
-  ejecutable en tests con Node sin mocks extra.
-- **Timeout de 9 s** con `AbortSignal.timeout()` en cada `fetch` de scraping: un origen
-  colgado no puede agotar el tiempo de CPU del Worker ni dejar a Stremio esperando.
-- **Cabeceras HTTP saneadas** (`safeHeaderValue`): los mensajes de error pueden contener
-  Unicode y HTTP sólo admite *ByteString* (Latin-1). Sin este saneado, un `→` en un log
-  hacía lanzar al construir la respuesta de diagnóstico.
-- **`X-Proxy-Detail` se trunca a 200 caracteres** y se eliminan `\r\n` (anti
-  *header injection*).
-- **Anti-SSRF en `/proxy`**: sólo `http(s)` y se rechazan URLs que apunten al propio
-  Worker (bucle).
-- **Sin secretos**: no hay claves API ni tokens en el código, así que no se necesita
-  `.dev.vars`.
-- **Coste**: 1 subrequest para el embed y hasta 4 solicitudes relacionadas con
-  `DEEP_SCAN=1` (5 como máximo para resolver un stream); en modo proxy se suma 1 por
-  playlist/segmento. El deep scan es acotado y conviene vigilar las cuotas si se comparte.
-
----
-
-## 7. Estructura del proyecto
-
-```
-.
-├── src/index.js            # El Worker. Autocontenido: copiar y pegar en el panel.
-├── tools/mock-origin.mjs   # Origen de vídeo de pega (sólo desarrollo).
-├── test/
-│   ├── extract.test.mjs    # Tests de la lógica de extracción.
-│   └── router.test.mjs     # Tests de integración del router (fetch mockeado).
-├── wrangler.toml           # Despliegue con wrangler + variables por defecto.
-├── package.json
-└── LICENSE                 # AGPL-3.0
-```
-
-## 8. Licencia y aviso
-
-AGPL-3.0-or-later (ver [`LICENSE`](LICENSE)).
-
-Este código es material de estudio sobre el protocolo de addons de Stremio, scraping
-desde el edge y manipulación de playlists HLS. El addon no aloja ni distribuye
-contenido: sólo resuelve lo que un tercero ya publica. Es responsabilidad de quien lo
-despliegue comprobar que el uso del servicio de origen y del contenido resultante es
-lícito en su jurisdicción y respeta los términos del proveedor.
+AGPL-3.0-or-later. Consulta [`LICENSE`](LICENSE).
