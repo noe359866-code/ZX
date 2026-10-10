@@ -18,6 +18,8 @@ import {
   unpackPackedJs,
   isHlsUrl,
   describePlaylist,
+  listingItemToMeta,
+  listingPageFromSkip,
 } from '../src/index.js';
 
 const BASE = 'https://vimeus.com/e/movie?imdb=tt1234567&view_key=test-key';
@@ -547,4 +549,28 @@ test('describePlaylist: calidad máxima, variantes y directo', () => {
   assert.equal(describePlaylist('#EXTM3U\n#EXT-X-STREAM-INF:RESOLUTION=3840x2160\nuhd.m3u8').quality, '4K');
   assert.deepEqual(describePlaylist('#EXTM3U\n#EXTINF:4,\nseg.ts\n'), { quality: '', variants: 0, live: true });
   assert.deepEqual(describePlaylist('#EXTM3U\n#EXTINF:4,\nseg.ts\n#EXT-X-ENDLIST'), { quality: '', variants: 0, live: false });
+});
+
+// ---------------------------------------------------------------------------
+// API de listado → metas
+// ---------------------------------------------------------------------------
+test('listingItemToMeta: ids, imágenes y casos sin datos', () => {
+  assert.deepEqual(listingItemToMeta({ tmdb_id: 550, imdb_id: 'TT0137523', title: 'Fight Club', poster: '/p.jpg', backdrop: 'b.jpg' }, 'movie'), {
+    id: 'tt0137523', type: 'movie', name: 'Fight Club',
+    poster: 'https://image.tmdb.org/t/p/w500/p.jpg', background: 'https://image.tmdb.org/t/p/w1280/b.jpg', posterShape: 'poster',
+  });
+  assert.equal(listingItemToMeta({ tmdb_id: '99861', imdb_id: null, title: 'X' }, 'movie').id, 'tmdb:99861');
+  assert.equal(listingItemToMeta({ tmdb_id: 7, title: '', poster: 'https://cdn.example/p.png' }, 'series').poster, 'https://cdn.example/p.png');
+  assert.equal(listingItemToMeta({ tmdb_id: 7, title: '' }, 'series').name, 'tmdb:7');
+  assert.equal(listingItemToMeta({ tmdb_id: 0, imdb_id: 'nope' }, 'movie'), null);
+  assert.equal(listingItemToMeta(null, 'movie'), null);
+});
+
+test('listingPageFromSkip: 50 por página', () => {
+  assert.equal(listingPageFromSkip(undefined), 1);
+  assert.equal(listingPageFromSkip('0'), 1);
+  assert.equal(listingPageFromSkip('49'), 1);
+  assert.equal(listingPageFromSkip('50'), 2);
+  assert.equal(listingPageFromSkip('100'), 3);
+  assert.equal(listingPageFromSkip('abc'), 1);
 });

@@ -19,6 +19,7 @@ Stremio ──▶ /stream/movie/tt1234567.json ──▶ Worker
 | `GET` | `/manifest.json` | Manifiesto de Stremio. |
 | `GET` | `/stream/movie/{id}.json` | Resuelve una película y devuelve el HLS. |
 | `GET` | `/stream/series/{id}:{season}:{episode}.json` | Resuelve un episodio. |
+| `GET` | `/catalog/{movie\|series}/{vimeus-movies\|vimeus-series\|vimeus-animes}[/skip=N].json` | Catálogos "Vimeus · Películas / Series / Anime" desde la API de listado. Requiere `VIMEUS_API_KEY`. |
 | `GET` | `/proxy?url=<URL>[&ref=<origen>]` | Pasarela HLS opcional para playlists, variantes y segmentos. `ref` es el origen del host de terceros cuyo Referer espera el CDN. |
 | `GET` | `/debug/{movie\|series}/{id}?token=…[&html=1]` | Traza completa del scraping (páginas visitadas, URLs descubiertas, candidatos, calidad). Requiere `DEBUG_TOKEN`. |
 | `GET` | `/` | Healthcheck JSON; con `Accept: text/html`, consola de prueba. |
@@ -117,13 +118,30 @@ Los candidatos se absolutizan, validan como URLs HTTP(S) de playlist HLS, dedupl
 
 `/proxy` retransmite el manifiesto y los segmentos con `Range`, CORS y cabeceras de Vimeus. La URL de destino debe ser HTTP(S) y no puede apuntar al propio Worker.
 
+## Catálogos con la API de listado (opcional)
+
+Vimeus ofrece una API de listado de servidor (`GET https://vimeus.com/api/listing/{movies|series|animes}`, cabecera `X-API-Key`, 50 elementos por página). Si configuras `VIMEUS_API_KEY` el addon:
+
+- añade `catalog` a `resources` y publica tres catálogos en el manifiesto: **Vimeus · Películas** (`movie`), **Vimeus · Series** y **Vimeus · Anime** (ambos `series`), con paginación por `skip` (Stremio pide `skip=50`, `100`… y el addon lo traduce a `page=2`, `3`…);
+- convierte cada elemento en un `meta` de Stremio: id IMDb (`tt…`) si existe, si no `tmdb:ID` (ambos los acepta `/stream`), póster `https://image.tmdb.org/t/p/w500` + ruta y fondo `w1280`;
+- cachea cada página 5 minutos y, ante cualquier fallo, responde `{ "metas": [] }` con `X-Proxy-Error` (`invalid-api-key`, `upstream`) para no romper la interfaz. El fin de la paginación (404 "No content found" en Vimeus) devuelve una lista vacía sin error.
+
+Sin `VIMEUS_API_KEY` el manifiesto no anuncia catálogos y `/catalog/...` responde `{ "metas": [] }` con `X-Proxy-Error: missing-api-key`. La API Key sólo viaja del Worker a Vimeus: nunca aparece en el manifiesto ni en las respuestas.
+
+```bash
+npx wrangler secret put VIMEUS_API_KEY
+curl -s https://TU-WORKER.workers.dev/catalog/movie/vimeus-movies.json | head -c 600
+curl -s https://TU-WORKER.workers.dev/catalog/series/vimeus-animes/skip=50.json | head -c 600
+```
+
 ## Variables y secretos
 
 | Variable | Valor por defecto | Efecto |
 | --- | --- | --- |
 | `VIMEUS_VIEW_KEY` | — | Clave para el embed de Vimeus. **Obligatoria. Configúrala como secreto; no la guardes en Git ni la compartas en el chat.** |
 | `VIMEUS_ORIGIN` | `https://vimeus.com` | Origen de Vimeus. |
-| `VIMEUS_REFERER` | `https://vimeus.com/` | Referer con el que se pide el embed de Vimeus (equivale al `referrerpolicy="origin"` del iframe). Si tu `view_key` tiene dominios permitidos, pon exactamente el origen autorizado, p. ej. `https://misitio.com/`. Para el HLS de terceros se usa automáticamente el origen del host donde apareció. |
+| `VIMEUS_REFERER` | `https://vimeus.com/` | Referer con el que se pide el embed de Vimeus (equivale al `referrerpolicy="origin"` del iframe). Según la documentación oficial el único dominio de embed válido es `vimeus.com`, así que el valor por defecto es el correcto; cámbialo sólo si Vimeus te autoriza otro origen. Para el HLS de terceros se usa automáticamente el origen del host donde apareció. |
+| `VIMEUS_API_KEY` | — | API Key de la API de listado (`X-API-Key`). Opcional: habilita los catálogos. Configúrala como secreto; es de uso exclusivo en servidor. |
 | `VIMEUS_MOVIE_PATH` | `/e/movie` | Ruta de película en Vimeus. |
 | `VIMEUS_SERIES_PATHS` | `/e/serie,/e/anime` | Rutas probadas para series/anime, en ese orden. |
 | `VIEW_KEY` | — | Alias heredado de `VIMEUS_VIEW_KEY`. |

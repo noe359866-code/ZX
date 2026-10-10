@@ -17,6 +17,7 @@
  *    GET /e/movie?imdb=tt5555555&view_key=… → script ofuscado con p.a.c.k.e.r
  *    GET /e/serie|/e/anime?tmdb=…&se=&ep=   → episodios (mismo fixture JWPlayer)
  *    GET /api/source/tt9999999              → JSON con la URL del stream
+ *    GET /api/listing/{movies|series|animes}?page=N → API de listado (X-API-Key: local-api-key)
  *    GET /hls/.../*.m3u8                    → playlists (exigen Referer, si no → 403)
  *    GET /hls/.../*.ts                      → segmentos de pega (exigen Referer)
  * ============================================================================
@@ -116,6 +117,45 @@ const embedPacked = (req) => `<!doctype html>
 
 /** Mock del embed Vimeus; requiere la clave de prueba local, no una clave real. */
 const VIMEUS_MOCK_VIEW_KEY = 'local-test-key';
+const VIMEUS_MOCK_API_KEY = 'local-api-key';
+
+/**
+ * Imita GET /api/listing/{movies|series|animes}: exige X-API-Key, pagina de
+ * 50 en 50 y responde 404 "No content found" cuando la página no existe.
+ * Devuelve [status, bodyJson] para `send`.
+ */
+function listingApi(req, url, kind) {
+  const fail = (status, message) => [status, JSON.stringify({ error: true, message, data: null })];
+  if (req.headers['x-api-key'] !== VIMEUS_MOCK_API_KEY) return fail(401, 'API key is required');
+  const page = Number.parseInt(url.searchParams.get('page') ?? '1', 10);
+  if (!Number.isInteger(page) || page < 1) return fail(400, 'Invalid page number');
+
+  const catalog = {
+    movies: [
+      { tmdb_id: 1001, imdb_id: 'tt1234567', title: 'Película de prueba (JWPlayer)', content_type: 'movie' },
+      { tmdb_id: 1002, imdb_id: 'tt9999999', title: 'Película deep-scan', content_type: 'movie' },
+      { tmdb_id: 1003, imdb_id: 'tt5555555', title: 'Película p.a.c.k.e.r', content_type: 'movie' },
+      { tmdb_id: 1004, imdb_id: 'tt0000000', title: 'Película sin HLS', content_type: 'movie' },
+    ],
+    series: [
+      { tmdb_id: 1396, imdb_id: 'tt0903747', title: 'Breaking Bad', content_type: 'series', total_seasons: 5, total_episodes: 62 },
+    ],
+    animes: [
+      { tmdb_id: 1429, imdb_id: 'tt2560140', title: 'Attack on Titan', content_type: 'anime', total_seasons: 4, total_episodes: 89 },
+    ],
+  }[kind];
+  // Rellena hasta 50 para que el cliente pueda probar el scroll (skip=50 → page 2 → 404).
+  const items = Array.from({ length: 50 }, (_, i) => {
+    const base = catalog[i % catalog.length];
+    return { id: i + 1, ...base, title: i < catalog.length ? base.title : `${base.title} #${i + 1}`, imdb_id: i < catalog.length ? base.imdb_id : null, tmdb_id: i < catalog.length ? base.tmdb_id : base.tmdb_id * 100 + i, poster: '/mock-poster.jpg', backdrop: '/mock-backdrop.jpg', synced_at: '2025-01-15T10:30:00Z' };
+  });
+  if (page > 1) return fail(404, 'No content found');
+  return [200, JSON.stringify({
+    error: false,
+    message: 'Success',
+    data: { [kind]: items, pagination: { current_page: 1, total_pages: 1, total_results: items.length, per_page: 50, has_next: false, has_prev: false } },
+  })];
+}
 const embedVimeus = (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   if (url.searchParams.get('view_key') !== VIMEUS_MOCK_VIEW_KEY) {
@@ -159,6 +199,12 @@ const server = createServer((req, res) => {
   // --- Embed Vimeus -------------------------------------------------------
   if (path === '/e/movie' || path === '/e/serie' || path === '/e/anime') {
     return embedVimeus(req, res);
+  }
+
+  // --- API de listado (catálogos) ------------------------------------------
+  const listing = path.match(/^\/api\/listing\/(movies|series|animes)$/);
+  if (listing) {
+    return send(res, ...listingApi(req, url, listing[1]), 'application/json; charset=utf-8');
   }
 
   // --- API usada por el deep-scan ------------------------------------------

@@ -37,6 +37,19 @@ const ADDON = Object.freeze({
   contactEmail: 'addon@example.com',
 });
 
+/**
+ * Catálogos de Stremio respaldados por la API de listado de Vimeus
+ * (GET /api/listing/{movies|series|animes}, cabecera X-API-Key, 50 por página).
+ * Sólo se publican en el manifiesto cuando VIMEUS_API_KEY está configurada.
+ */
+const CATALOGS = Object.freeze([
+  { id: 'vimeus-movies', type: 'movie', name: 'Vimeus · Películas', listing: 'movies', field: 'movies' },
+  { id: 'vimeus-series', type: 'series', name: 'Vimeus · Series', listing: 'series', field: 'series' },
+  { id: 'vimeus-animes', type: 'series', name: 'Vimeus · Anime', listing: 'animes', field: 'animes' },
+]);
+const LISTING_PAGE_SIZE = 50;
+const TMDB_IMAGE_BASE = 'https://image.tmdb.org/t/p';
+
 const VIMEUS_DEFAULTS = Object.freeze({
   origin: 'https://vimeus.com',
   moviePath: '/e/movie',
@@ -56,6 +69,8 @@ export function resolveVimeusSource(env) {
   const origin = normalizeOrigin(env?.VIMEUS_ORIGIN, VIMEUS_DEFAULTS.origin);
   const referer = String(env?.VIMEUS_REFERER || `${origin}/`).trim();
   const viewKey = String(env?.VIMEUS_VIEW_KEY || env?.VIEW_KEY || '').trim();
+  // API Key de la API de listado (X-API-Key). Opcional: habilita los catálogos.
+  const apiKey = String(env?.VIMEUS_API_KEY || '').trim();
   const moviePath = String(env?.VIMEUS_MOVIE_PATH || VIMEUS_DEFAULTS.moviePath).trim();
   const seriesPaths = String(
     env?.VIMEUS_SERIES_PATHS || VIMEUS_DEFAULTS.seriesPaths.join(','),
@@ -95,6 +110,7 @@ export function resolveVimeusSource(env) {
     origin,
     referer,
     viewKey,
+    apiKey,
     moviePath,
     seriesPaths,
     embedUrlsFor,
@@ -1076,6 +1092,7 @@ async function fetchText(url, headers, timeoutMs = LIMITS.fetchTimeoutMs) {
  */
 export function buildManifest(env) {
   const source = resolveVimeusSource(env);
+  const withCatalogs = Boolean(source.apiKey);
   return {
     id: ADDON.id,
     version: ADDON.version,
@@ -1083,11 +1100,152 @@ export function buildManifest(env) {
     description: ADDON.description,
     logo: `${source.origin}/favicon.ico`,
     background: `${source.origin}/assets/images/background.jpg`,
-    resources: [...ADDON.resources],
+    resources: withCatalogs ? [...ADDON.resources, 'catalog'] : [...ADDON.resources],
     types: [...ADDON.types],
     idPrefixes: [...ADDON.idPrefixes],
+    catalogs: withCatalogs
+      ? CATALOGS.map((catalog) => ({
+          id: catalog.id,
+          type: catalog.type,
+          name: catalog.name,
+          extra: [{ name: 'skip', isRequired: false }],
+        }))
+      : [],
     behaviorHints: { configurable: false, configurationRequired: false },
   };
+}
+
+/**
+ * Convierte un elemento de la API de listado en un `meta` de Stremio.
+ * Se prefiere el id IMDb (`tt…`) porque Cinemeta completa la ficha; si falta,
+ * se usa `tmdb:ID`, que el addon también acepta en /stream.
+ *
+ * @param {object} item elemento de data.movies|series|animes
+ * @param {string} type 'movie' | 'series'
+ * @returns {object|null}
+ */
+export function listingItemToMeta(item, type) {
+  const imdb = String(item?.imdb_id ?? '').trim();
+  const tmdb = Number.parseInt(item?.tmdb_id, 10);
+  const id = /^tt\d+$/i.test(imdb) ? imdb.toLowerCase() : Number.isInteger(tmdb) && tmdb > 0 ? `tmdb:${tmdb}` : '';
+  if (!id) return null;
+
+  const image = (path, size) => {
+    const value = String(path ?? '').trim();
+    if (!value) return undefined;
+    if (/^https?:\/\//i.test(value)) return value;
+    return `${TMDB_IMAGE_BASE}/${size}${value.startsWith('/') ? '' : '/'}${value}`;
+  };
+
+  const meta = {
+    id,
+    type,
+    name: String(item?.title ?? '').trim() || id,
+    poster: image(item?.poster, 'w500'),
+    background: image(item?.backdrop, 'w1280'),
+    posterShape: 'poster',
+  };
+  if (item?.content_type === 'anime') meta.genres = ['Anime'];
+  if (!meta.poster) delete meta.poster;
+  if (!meta.background) delete meta.background;
+  return meta;
+}
+
+/** Traduce el `skip` de Stremio a la página (1-based, 50 por página) de Vimeus. */
+export function listingPageFromSkip(rawSkip) {
+  const skip = Number.parseInt(rawSkip, 10);
+  if (!Number.isInteger(skip) || skip <= 0) return 1;
+  return Math.floor(skip / LISTING_PAGE_SIZE) + 1;
+}
+
+/** Analiza `extra` de la ruta de catálogo ("skip=50&genre=x") de forma tolerante. */
+function parseCatalogExtra(raw) {
+  const extra = {};
+  const text = String(raw ?? '').replace(/\.json$/i, '');
+  if (!text) return extra;
+  for (const pair of text.split('&')) {
+    const [key, ...rest] = pair.split('=');
+    if (!key) continue;
+    try {
+      extra[decodeURIComponent(key)] = decodeURIComponent(rest.join('='));
+    } catch {
+      extra[key] = rest.join('=');
+    }
+  }
+  return extra;
+}
+
+/**
+ * `/catalog/{type}/{id}[/skip=N].json` → metas desde la API de listado.
+ * Sin VIMEUS_API_KEY o con un catálogo desconocido responde `{metas: []}`.
+ */
+async function handleCatalog(type, catalogId, extraRaw, env) {
+  const source = resolveVimeusSource(env);
+  const catalog = CATALOGS.find((c) => c.id === catalogId && c.type === type);
+  if (!catalog) return jsonResponse({ metas: [] }, 404, { 'X-Proxy-Error': 'unknown-catalog' });
+  if (!source.apiKey) return jsonResponse({ metas: [] }, 200, { 'X-Proxy-Error': 'missing-api-key' });
+
+  const extra = parseCatalogExtra(extraRaw);
+  const page = listingPageFromSkip(extra.skip);
+  const listingUrl = `${source.origin}/api/listing/${catalog.listing}?page=${page}`;
+
+  try {
+    const response = await fetch(listingUrl, {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+        'X-API-Key': source.apiKey,
+        'User-Agent': BROWSER_UA,
+      },
+      signal: AbortSignal.timeout(LIMITS.fetchTimeoutMs),
+    });
+
+    let payload = null;
+    try {
+      payload = await response.json();
+    } catch {
+      payload = null;
+    }
+
+    if (response.status === 401) {
+      return jsonResponse({ metas: [] }, 200, {
+        'X-Proxy-Error': 'invalid-api-key',
+        'X-Proxy-Detail': safeDiagnostic(payload?.message || 'API key rechazada'),
+      });
+    }
+    // Página fuera de rango: Vimeus responde 404 "No content found" → fin del scroll.
+    if (response.status === 404) {
+      return jsonResponse({ metas: [] }, 200, { 'Cache-Control': 'public, max-age=300' });
+    }
+    if (!response.ok || payload?.error) {
+      return jsonResponse({ metas: [] }, 200, {
+        'X-Proxy-Error': 'upstream',
+        'X-Proxy-Detail': safeDiagnostic(payload?.message || `HTTP ${response.status}`),
+      });
+    }
+
+    const items = Array.isArray(payload?.data?.[catalog.field]) ? payload.data[catalog.field] : [];
+    const seen = new Set();
+    const metas = [];
+    for (const item of items) {
+      const meta = listingItemToMeta(item, catalog.type);
+      if (!meta || seen.has(meta.id)) continue;
+      seen.add(meta.id);
+      metas.push(meta);
+    }
+
+    return jsonResponse({ metas }, 200, {
+      'Cache-Control': 'public, max-age=300',
+      'X-Listing-Page': String(page),
+      'X-Listing-Total-Pages': String(payload?.data?.pagination?.total_pages ?? ''),
+    });
+  } catch (err) {
+    console.warn(`[${source.key}] catálogo ${catalog.id} falló: ${safeDiagnostic(err?.message)}`);
+    return jsonResponse({ metas: [] }, 200, {
+      'X-Proxy-Error': 'upstream',
+      'X-Proxy-Detail': safeDiagnostic(err?.message),
+    });
+  }
 }
 
 /**
@@ -1830,6 +1988,7 @@ export function healthHtml(info) {
       <dt>Instalar en Stremio</dt><dd><code id="install">${info.install}</code></dd>
       <dt>Proveedor</dt><dd><code>${info.provider}</code></dd>
       <dt>Vimeus view_key</dt><dd><code>${info.vimeusConfigured ? 'configurada' : 'no configurada; el addon no devolverá streams'}</code></dd>
+      <dt>Catálogos (API Key)</dt><dd><code>${info.catalogsEnabled ? 'activos' : 'desactivados; configura VIMEUS_API_KEY'}</code></dd>
       <dt>Origen</dt><dd><code>${info.source}</code></dd>
       <dt>Manifiesto</dt><dd><a href="/manifest.json">/manifest.json</a></dd>
     </dl>
@@ -1862,6 +2021,7 @@ export function healthHtml(info) {
       <li><code>GET /manifest.json</code></li>
       <li><code>GET /stream/movie/{id}.json</code></li>
       <li><code>GET /stream/series/{id}:{temporada}:{episodio}.json</code></li>
+      <li><code>GET /catalog/{movie|series}/{vimeus-movies|vimeus-series|vimeus-animes}[/skip=N].json</code> — requiere <code>VIMEUS_API_KEY</code></li>
       <li><code>GET /proxy?url=&lt;m3u8|segmento&gt;[&amp;ref=&lt;origen&gt;]</code> — pasarela HLS</li>
       <li><code>GET /debug/{movie|series}/{id}?token=…[&amp;html=1]</code> — traza de scraping (requiere <code>DEBUG_TOKEN</code>)</li>
       <li><code>OPTIONS *</code> — preflight CORS</li>
@@ -1904,6 +2064,9 @@ document.getElementById('mid').addEventListener('keydown', function(e){
 
 /** /stream/[movie|series|tv]/{id}[.json] (series admite id:temporada:episodio). */
 const STREAM_ROUTE_RE = /^\/stream\/(?:(movie|series|tv|channel)\/)?(.+)$/i;
+
+/** /catalog/{type}/{id}[/{extra}].json — catálogos de la API de listado. */
+const CATALOG_ROUTE_RE = /^\/catalog\/(movie|series)\/([^/]+?)(?:\/([^/]+?))?(?:\.json)?$/i;
 
 /** /debug/[movie|series|tv]/{id} — traza de scraping protegida por DEBUG_TOKEN. */
 const DEBUG_ROUTE_RE = /^\/debug\/(movie|series|tv)\/(.+)$/i;
@@ -1950,10 +2113,12 @@ export default {
           source: source.origin,
           provider: source.key,
           vimeusConfigured: Boolean(source.viewKey),
+          catalogsEnabled: Boolean(source.apiKey),
           endpoints: [
             '/manifest.json',
             '/stream/movie/{id}.json',
             '/stream/series/{id}:{season}:{episode}.json',
+            '/catalog/{type}/{id}.json (requiere VIMEUS_API_KEY)',
             '/proxy?url=',
             '/debug/{movie|series}/{id}?token= (requiere DEBUG_TOKEN)',
           ],
@@ -1976,6 +2141,17 @@ export default {
         return jsonResponse(buildManifest(env), 200, {
           'Cache-Control': 'public, max-age=3600',
         });
+      }
+
+      // --- Catálogos (API de listado; requiere VIMEUS_API_KEY) ---------------
+      const catalogMatch = rawPath.match(CATALOG_ROUTE_RE);
+      if (catalogMatch) {
+        return await handleCatalog(
+          catalogMatch[1].toLowerCase(),
+          catalogMatch[2].replace(/\.json$/i, ''),
+          catalogMatch[3] ?? '',
+          env,
+        );
       }
 
       // --- Streams ---------------------------------------------------------
@@ -2001,7 +2177,7 @@ export default {
       return jsonResponse(
         {
           error: 'Not Found',
-          hint: 'Rutas válidas: /manifest.json, /stream/movie/{id}.json, /stream/series/{id}:{season}:{episode}.json',
+          hint: 'Rutas válidas: /manifest.json, /stream/movie/{id}.json, /stream/series/{id}:{season}:{episode}.json, /catalog/{type}/{id}.json',
         },
         404,
       );
@@ -2009,6 +2185,7 @@ export default {
       // Red de seguridad global: el Worker nunca debe devolver un stack trace.
       console.error(`[addon] error no controlado en ${path}: ${safeDiagnostic(err?.message)}`);
       if (path.startsWith('/stream')) return jsonResponse({ streams: [] }, 200);
+      if (path.startsWith('/catalog')) return jsonResponse({ metas: [] }, 200);
       return jsonResponse({ error: 'Internal Server Error' }, 500);
     }
   },

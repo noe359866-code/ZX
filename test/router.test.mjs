@@ -101,6 +101,7 @@ test('raíz: healthcheck con la URL de instalación', async () => {
   assert.equal(body.status, 'ok');
   assert.equal(body.provider, 'vimeus');
   assert.equal(body.vimeusConfigured, true);
+  assert.equal(body.catalogsEnabled, false);
   assert.equal(body.install, `${WORKER_URL}/manifest.json`);
   assert.ok(!JSON.stringify(body).includes(VIEW_KEY), 'el healthcheck no expone la view_key');
 });
@@ -935,6 +936,108 @@ test('/debug sin view_key: informa missing-view-key sin tocar el origen', async 
   );
   const body = await res.json();
   assert.equal(body.result.code, 'missing-view-key');
+  assert.equal(calls.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Catálogos — API de listado (X-API-Key)
+// ---------------------------------------------------------------------------
+const LISTING_MOVIES = {
+  error: false,
+  message: 'Success',
+  data: {
+    movies: [
+      { id: 1, content_type: 'movie', tmdb_id: 550, imdb_id: 'tt0137523', title: 'Fight Club', poster: '/pB8.jpg', backdrop: '/fCa.jpg', synced_at: '2025-01-15T10:30:00Z' },
+      { id: 2, content_type: 'movie', tmdb_id: 99861, imdb_id: null, title: 'Avengers: Era de Ultrón', poster: null, backdrop: null },
+      { id: 3, content_type: 'movie', tmdb_id: 550, imdb_id: 'tt0137523', title: 'Fight Club (dup)' },
+      { id: 4, content_type: 'movie', tmdb_id: null, imdb_id: '', title: 'sin ids' },
+    ],
+    pagination: { current_page: 1, total_pages: 45, total_results: 2234, per_page: 50, has_next: true, has_prev: false },
+  },
+};
+
+test('manifest: sin VIMEUS_API_KEY no publica catálogos', async () => {
+  const m = await (await call('/manifest.json')).json();
+  assert.deepEqual(m.resources, ['stream']);
+  assert.deepEqual(m.catalogs, []);
+});
+
+test('manifest: con VIMEUS_API_KEY publica los tres catálogos con skip', async () => {
+  const m = await (await worker.fetch(new Request(`${WORKER_URL}/manifest.json`), { VIMEUS_API_KEY: 'k' }, {})).json();
+  assert.deepEqual(m.resources, ['stream', 'catalog']);
+  assert.deepEqual(m.catalogs.map((c) => [c.type, c.id]), [
+    ['movie', 'vimeus-movies'], ['series', 'vimeus-series'], ['series', 'vimeus-animes'],
+  ]);
+  assert.deepEqual(m.catalogs[0].extra, [{ name: 'skip', isRequired: false }]);
+  assert.ok(!JSON.stringify(m).includes('"k"'), 'la API key no se publica');
+});
+
+test('/catalog: traduce el listado a metas de Stremio (IMDb preferido, póster TMDB, sin duplicados)', async () => {
+  const calls = mockFetch((url, init) => {
+    assert.equal(url, 'https://vimeus.com/api/listing/movies?page=1');
+    assert.equal(init.headers['X-API-Key'], 'api-secret');
+    return new Response(JSON.stringify(LISTING_MOVIES), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  });
+
+  const res = await worker.fetch(new Request(`${WORKER_URL}/catalog/movie/vimeus-movies.json`), { VIMEUS_API_KEY: 'api-secret' }, {});
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get('Cache-Control'), /max-age=300/);
+  assert.equal(res.headers.get('X-Listing-Total-Pages'), '45');
+  const { metas } = await res.json();
+  assert.deepEqual(metas.map((m) => m.id), ['tt0137523', 'tmdb:99861']);
+  assert.equal(metas[0].type, 'movie');
+  assert.equal(metas[0].name, 'Fight Club');
+  assert.equal(metas[0].poster, 'https://image.tmdb.org/t/p/w500/pB8.jpg');
+  assert.equal(metas[0].background, 'https://image.tmdb.org/t/p/w1280/fCa.jpg');
+  assert.equal(metas[1].poster, undefined);
+  assert.equal(calls.length, 1);
+});
+
+test('/catalog: skip se traduce a página (50 por página) y acepta la ruta con extra', async () => {
+  const calls = mockFetch(() => new Response(JSON.stringify({ error: false, data: { animes: [
+    { tmdb_id: 46261, imdb_id: 'tt2560140', title: 'Attack on Titan', content_type: 'anime' },
+  ] } }), { status: 200 }));
+  const env = { VIMEUS_API_KEY: 'k' };
+  const r1 = await worker.fetch(new Request(`${WORKER_URL}/catalog/series/vimeus-animes/skip=100.json`), env, {});
+  const { metas } = await r1.json();
+  assert.equal(new URL(calls[0].url).searchParams.get('page'), '3');
+  assert.equal(calls[0].url.split('?')[0], 'https://vimeus.com/api/listing/animes');
+  assert.equal(metas[0].type, 'series');
+  assert.deepEqual(metas[0].genres, ['Anime']);
+  assert.equal(r1.headers.get('X-Listing-Page'), '3');
+
+  await worker.fetch(new Request(`${WORKER_URL}/catalog/series/vimeus-series/skip=49.json`), env, {});
+  assert.equal(new URL(calls[1].url).searchParams.get('page'), '1');
+  assert.equal(calls[1].url.split('?')[0], 'https://vimeus.com/api/listing/series');
+});
+
+test('/catalog: errores de la API → metas vacío con diagnóstico, sin romper Stremio', async () => {
+  const env = { VIMEUS_API_KEY: 'k' };
+  mockFetch(() => new Response(JSON.stringify({ error: true, message: 'API key is required', data: null }), { status: 401 }));
+  const unauthorized = await worker.fetch(new Request(`${WORKER_URL}/catalog/movie/vimeus-movies.json`), env, {});
+  assert.deepEqual(await unauthorized.json(), { metas: [] });
+  assert.equal(unauthorized.headers.get('X-Proxy-Error'), 'invalid-api-key');
+
+  mockFetch(() => new Response(JSON.stringify({ error: true, message: 'No content found', data: null }), { status: 404 }));
+  const end = await worker.fetch(new Request(`${WORKER_URL}/catalog/movie/vimeus-movies/skip=5000.json`), env, {});
+  assert.deepEqual(await end.json(), { metas: [] });
+  assert.equal(end.headers.get('X-Proxy-Error'), null, 'fin de la paginación no es un error');
+
+  mockFetch(() => { throw new Error('red caída'); });
+  const down = await worker.fetch(new Request(`${WORKER_URL}/catalog/movie/vimeus-movies.json`), env, {});
+  assert.deepEqual(await down.json(), { metas: [] });
+  assert.equal(down.headers.get('X-Proxy-Error'), 'upstream');
+});
+
+test('/catalog: sin API key o catálogo desconocido no toca la red', async () => {
+  const calls = mockFetch(() => htmlResponse('nope'));
+  const noKey = await call('/catalog/movie/vimeus-movies.json');
+  assert.deepEqual(await noKey.json(), { metas: [] });
+  assert.equal(noKey.headers.get('X-Proxy-Error'), 'missing-api-key');
+  const unknown = await worker.fetch(new Request(`${WORKER_URL}/catalog/movie/otro.json`), { VIMEUS_API_KEY: 'k' }, {});
+  assert.equal(unknown.status, 404);
+  const wrongType = await worker.fetch(new Request(`${WORKER_URL}/catalog/movie/vimeus-series.json`), { VIMEUS_API_KEY: 'k' }, {});
+  assert.equal(wrongType.status, 404);
   assert.equal(calls.length, 0);
 });
 

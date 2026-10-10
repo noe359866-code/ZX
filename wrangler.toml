@@ -50,6 +50,10 @@ MAX_DEEP_SCAN = "6"
 # Token para /debug/{movie|series}/{id}?token=… (traza del scraping).
 # Configúralo como secreto sólo mientras depuras: npx wrangler secret put DEBUG_TOKEN
 
+# API Key de la API de listado de Vimeus (cabecera X-API-Key). Opcional: al
+# configurarla el manifiesto publica los catálogos "Vimeus · Películas/Series/Anime".
+# Es de uso exclusivo en servidor: npx wrangler secret put VIMEUS_API_KEY
+
 # Nº máximo de candidatos .m3u8 devueltos como streams alternativos.
 MAX_STREAMS = "3"
 
