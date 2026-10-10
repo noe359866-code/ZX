@@ -41,7 +41,7 @@ Ejemplo de respuesta:
   "streams": [
     {
       "name": "Vimeus HLS",
-      "title": "Vimeus [HLS]",
+      "title": "Vimeus [HLS · 1080p]",
       "type": "hls",
       "url": "https://cdn.example/master.m3u8?token=…",
       "behaviorHints": {
@@ -74,11 +74,14 @@ Si no se encuentra HLS, se devuelve `200 {"streams": []}` para no romper Stremio
 El extractor normaliza el HTML/JS estático antes de aplicar patrones. Reconoce, entre otros casos:
 
 - URLs JSON escapadas (`https:\/\/…`), escapes Unicode/hex y entidades HTML.
-- URLs codificadas en porcentaje, incluso con doble codificación, y payloads Base64 comunes.
+- URLs codificadas en porcentaje, incluso con doble codificación, y payloads Base64 comunes (también anidados).
+- **Scripts empaquetados con p.a.c.k.e.r** (`eval(function(p,a,c,k,e,d){…})`), incluidos los anidados: se desempaquetan como texto, sin `eval`.
+- **Cadenas invertidas** (`"8u3m.retsam/…".split("").reverse().join("")`).
 - Configuraciones de reproductores (`file`, `src`, `source`, `hlsUrl`, `playlist`, etc.), rutas relativas, URLs entrecomilladas y URLs construidas por concatenación.
-- Redirecciones, playlists directas y referencias a iframes/configuración mediante un deep scan limitado.
+- **HLS sin extensión `.m3u8`**: fuentes con `type: "application/x-mpegURL"` / `"hls"`, URLs con `?format=m3u8` / `?type=hls`, `.m3u` y el formato Azure `manifest(format=m3u8-aapl)`.
+- Redirecciones, playlists directas y referencias a iframes/configuración mediante un deep scan limitado, que también sigue `<meta http-equiv="refresh">` y `location.href = …`. Los endpoints de API (`/api/…`, `.json`, `.php`…) se piden con cabeceras XHR (`X-Requested-With`, `Accept: application/json`).
 
-Los candidatos se absolutizan, validan como URLs HTTP(S) con ruta `.m3u8`, deduplican y ordenan. Con `VERIFY_HLS=1` cada candidato se solicita con las cabeceras de Vimeus y se exige una respuesta `#EXTM3U`. El análisis es estático: **no se ejecuta el player ni se eluden controles de acceso**. Un HLS que requiere sesión, DRM o tokens no expuestos no se puede resolver con este mecanismo.
+Los candidatos se absolutizan, validan como URLs HTTP(S) de playlist HLS, deduplican y ordenan por confianza (las URLs de `preview`/`trailer`/`ads` quedan al final). Con `VERIFY_HLS=1` cada candidato se solicita **en paralelo** con las cabeceras de Vimeus y se exige una respuesta `#EXTM3U`; de la master playlist verificada se extrae la resolución máxima para el título del stream (`Vimeus [HLS · 1080p]`, `4K`, `LIVE`). El análisis es estático: **no se ejecuta el player ni se eluden controles de acceso**. Un HLS que requiere sesión, DRM o tokens no expuestos no se puede resolver con este mecanismo.
 
 `/proxy` retransmite el manifiesto y los segmentos con `Range`, CORS y cabeceras de Vimeus. La URL de destino debe ser HTTP(S) y no puede apuntar al propio Worker.
 
@@ -124,7 +127,7 @@ npm run mock                 # http://0.0.0.0:8788
 npm run dev:local            # http://0.0.0.0:8787
 ```
 
-El mock sólo acepta la clave de desarrollo `local-test-key`; no es una clave real ni debe usarse en producción. Reproduce respuestas HLS directas, deep scan, páginas sin stream, playlists, segmentos `Range` y solicitudes sin `Referer`.
+El mock sólo acepta la clave de desarrollo `local-test-key`; no es una clave real ni debe usarse en producción. Reproduce respuestas HLS directas, deep scan, scripts empaquetados, páginas sin stream, playlists, segmentos `Range` y solicitudes sin `Referer`.
 
 Ejemplos con el Worker local:
 
@@ -132,6 +135,7 @@ Ejemplos con el Worker local:
 curl -s localhost:8787/manifest.json | jq
 curl -s localhost:8787/stream/movie/tt1234567.json | jq
 curl -s localhost:8787/stream/movie/tt9999999.json | jq         # deep scan vía /api/source
+curl -s localhost:8787/stream/movie/tt5555555.json | jq         # script ofuscado (p.a.c.k.e.r)
 curl -s localhost:8787/stream/movie/tt0000000.json -D -         # HLS ausente → diagnóstico
 curl -s localhost:8787/stream/series/tt0903747:1:2.json | jq
 ```

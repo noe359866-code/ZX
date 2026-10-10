@@ -132,6 +132,42 @@ function scrapeHeaders(source, referer = source.referer) {
   };
 }
 
+/** Endpoints que los reproductores piden por XHR/fetch, no como documento. */
+const API_LIKE_URL_RE =
+  /\.(?:json|php|txt|xml|aspx?)(?:$|\?)|\/(?:api|ajax|v\d+|sources?|getsources?|get_?source|get_?link|config|load|fetch|resolve)(?:\/|$|\?)/i;
+
+/**
+ * Cabeceras para endpoints de configuración/API durante el deep scan. Muchos
+ * backends exigen `X-Requested-With` y un `Accept` JSON para responder.
+ */
+function apiHeaders(source, referer = source.referer) {
+  return {
+    'User-Agent': BROWSER_UA,
+    Accept: 'application/json, text/javascript, text/plain, */*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    Referer: referer,
+    Origin: source.origin,
+    'X-Requested-With': 'XMLHttpRequest',
+    'Sec-Fetch-Dest': 'empty',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Site': 'same-origin',
+  };
+}
+
+/** Elige las cabeceras de deep scan según el aspecto de la URL destino. */
+function deepScanHeaders(source, targetUrl, referer) {
+  let pathAndQuery = targetUrl;
+  try {
+    const parsed = new URL(targetUrl);
+    pathAndQuery = `${parsed.pathname}${parsed.search}`;
+  } catch {
+    /* se evalúa la cadena completa */
+  }
+  return API_LIKE_URL_RE.test(pathAndQuery)
+    ? apiHeaders(source, referer)
+    : scrapeHeaders(source, referer);
+}
+
 /** Cabeceras CORS exigidas por Stremio (el addon se instala desde otro origen). */
 const CORS_HEADERS = Object.freeze({
   'Access-Control-Allow-Origin': '*',
@@ -189,8 +225,45 @@ const BARE_M3U8_RE =
  */
 const RELATIVE_M3U8_RE = /["'`]([^"'`\s<>\\/:]+\.m3u8(?:\?[^"'`\s<>\\]*)?)["'`]/gi;
 
+/**
+ * Patrón E (HLS sin extensión): una fuente cuyo `type` declara HLS aunque la
+ * URL no termine en ".m3u8" (CDNs con rutas tipo /hls/master o /manifest).
+ *   sources:[{src:"https://cdn/x/stream", type:"application/x-mpegURL"}]
+ *   <source src="https://cdn/x/live" type="application/vnd.apple.mpegurl">
+ */
+const HLS_TYPE_VALUE = '(?:application\\/(?:x-mpegurl|vnd\\.apple\\.mpegurl)|hls|m3u8)';
+const URL_KEYS = '(?:file|src|source|url|hls(?:_?url)?|video(?:_?url)?|stream(?:_?url)?|playlist|manifest|link|media|path)';
+const TYPED_URL_BEFORE_RE = new RegExp(
+  `\\b${URL_KEYS}\\s*[:=]\\s*["'\`]((?:(?:https?:)?\\/\\/|\\/)[^"'\`\\s<>\\\\]+)["'\`][^{}]{0,200}?\\btype\\s*[:=]\\s*["'\`]${HLS_TYPE_VALUE}["'\`]`,
+  'gi',
+);
+const TYPED_URL_AFTER_RE = new RegExp(
+  `\\btype\\s*[:=]\\s*["'\`]${HLS_TYPE_VALUE}["'\`][^{}]{0,200}?\\b${URL_KEYS}\\s*[:=]\\s*["'\`]((?:(?:https?:)?\\/\\/|\\/)[^"'\`\\s<>\\\\]+)["'\`]`,
+  'gi',
+);
+
+/**
+ * Patrón F (HLS por query o formato): la playlist se pide con un parámetro
+ * (?format=m3u8, ?type=hls, ?file=…m3u8) o con la sintaxis de Azure Media
+ * Services "manifest(format=m3u8-aapl)" en lugar de por extensión.
+ */
+const QUERY_HLS_RE =
+  /["'`]\s*((?:https?:)?\/\/[^"'`\s<>\\?]+?(?:\(format=m3u8|\?[^"'`\s<>\\]*?(?:m3u8|(?:format|type|output|protocol)=hls))[^"'`\s<>\\]*)\s*["'`]/gi;
+
 /** Prefijos base absolutos terminados en "/" presentes en el documento. */
 const BASE_PREFIX_RE = /["'`]((?:https?:)?\/\/[^"'`\s<>\\]*?\/)["'`]/gi;
+
+/**
+ * Código empaquetado con el "packer" de Dean Edwards:
+ *   eval(function(p,a,c,k,e,d){…}('payload',62,123,'a|b|c'.split('|'),0,{}))
+ * Se desempaqueta sustituyendo tokens por palabras clave: es una operación de
+ * texto, no se evalúa el JavaScript resultante.
+ */
+const PACKED_JS_RE =
+  /eval\s*\(\s*function\s*\(\s*p\s*,\s*a\s*,\s*c\s*,\s*k\s*,\s*e\s*,\s*[dr]\s*\)[\s\S]*?\}\s*\(\s*(['"])((?:\\.|(?!\1)[^\\])*)\1\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(['"])((?:\\.|(?!\5)[^\\])*)\5\s*\.split\s*\(\s*['"]\|['"]\s*\)/g;
+
+/** Marca de un ".m3u8" escrito al revés (ofuscación por inversión de cadena). */
+const REVERSED_M3U8_MARK = /8u3m\./;
 
 
 /**
@@ -203,11 +276,23 @@ const CONFIG_URL_RE = /["'`]((?:https?:)?\/\/[^"'`\s<>\\]+|(?:\/|\.\.?\/)[^"'`\s
 const TAG_URL_RE =
   /<(?:iframe|frame|script|source|video|embed|object|track)\b[^>]*?\b(?:src|data-src|data-url|data-file|data-source|href)\s*=\s*(["'`])([^"'`]+)\1/gi;
 
-/** Pesos por patrón: definen el orden de preferencia de los candidatos. */
+/** Redirecciones estáticas que a veces llevan al reproductor real. */
+const META_REFRESH_RE =
+  /<meta\b[^>]*http-equiv\s*=\s*["']?refresh["']?[^>]*content\s*=\s*["'][^"'>]*?url\s*=\s*['"]?([^"'\s>]+)/gi;
+const LOCATION_REDIRECT_RE =
+  /\b(?:(?:window|top|parent|document)\.)?location(?:\.href)?\s*=\s*["'`]([^"'`\s<>]+)["'`]|\blocation\.(?:replace|assign)\s*\(\s*["'`]([^"'`\s<>]+)["'`]/gi;
+
+/**
+ * Pesos por patrón: definen el orden de preferencia de los candidatos.
+ * `typed` marca los patrones cuya URL no necesita terminar en ".m3u8".
+ */
 const PATTERN_SCORES = [
   { re: KEYED_M3U8_RE, score: 100 },
   { re: RELATIVE_KEYED_M3U8_RE, score: 80 },
+  { re: TYPED_URL_BEFORE_RE, score: 70, typed: true },
+  { re: TYPED_URL_AFTER_RE, score: 70, typed: true },
   { re: QUOTED_M3U8_RE, score: 60 },
+  { re: QUERY_HLS_RE, score: 40 },
   { re: BARE_M3U8_RE, score: 30 },
 ];
 
@@ -407,6 +492,96 @@ function decodeBase64Payloads(raw, maxPayloads = 48) {
   return decoded.join('\n');
 }
 
+/** Resuelve escapes simples de un literal JS ('\'' → ', '\\' → \). */
+function unescapeJsLiteral(value) {
+  return String(value ?? '').replace(/\\(['"\\\/])/g, '$1');
+}
+
+/**
+ * Deshace un bloque empaquetado con el packer p.a.c.k.e.r (Dean Edwards).
+ * Cada token `\w+` del payload es un número en base `radix` (0-9a-zA-Z) que
+ * indexa la lista de palabras; cuando la palabra está vacía se conserva el
+ * token original. Es la misma transformación textual que haría el bootstrap,
+ * pero sin eval.
+ *
+ * @param {string} payload
+ * @param {number} radix
+ * @param {string[]} keywords
+ * @returns {string}
+ */
+function applyPacker(payload, radix, keywords) {
+  if (!Number.isInteger(radix) || radix < 2 || radix > 62 || keywords.length === 0) return '';
+
+  const digitValue = (code) => {
+    if (code >= 48 && code <= 57) return code - 48; // 0-9
+    if (code >= 97 && code <= 122) return code - 87; // a-z → 10-35
+    if (code >= 65 && code <= 90) return code - 29; // A-Z → 36-61
+    return -1;
+  };
+  const decode = (word) => {
+    let n = 0;
+    for (let i = 0; i < word.length; i++) {
+      const d = digitValue(word.charCodeAt(i));
+      if (d < 0 || d >= radix) return -1;
+      n = n * radix + d;
+      if (n > keywords.length) return -1;
+    }
+    return n;
+  };
+
+  return payload.replace(/\b\w+\b/g, (word) => {
+    const index = decode(word);
+    if (index < 0 || index >= keywords.length) return word;
+    return keywords[index] || word;
+  });
+}
+
+/**
+ * Localiza y desempaqueta todos los bloques p.a.c.k.e.r de un documento,
+ * incluidos los anidados (hasta `maxRounds` niveles).
+ *
+ * @param {string} raw
+ * @param {number} maxRounds
+ * @returns {string} código desempaquetado ("" si no había bloques)
+ */
+export function unpackPackedJs(raw, maxRounds = 3) {
+  let current = String(raw ?? '');
+  const output = [];
+
+  const unpackAll = (text) => {
+    const pieces = [];
+    PACKED_JS_RE.lastIndex = 0;
+    let m;
+    while ((m = PACKED_JS_RE.exec(text)) !== null) {
+      if (PACKED_JS_RE.lastIndex === m.index) PACKED_JS_RE.lastIndex++;
+      const payload = unescapeJsLiteral(m[2]);
+      const radix = Number.parseInt(m[3], 10);
+      const keywords = unescapeJsLiteral(m[6]).split('|');
+      const unpacked = applyPacker(payload, radix, keywords);
+      if (unpacked && unpacked !== payload) pieces.push(unpacked);
+    }
+    return pieces;
+  };
+
+  for (let round = 0; round < maxRounds; round++) {
+    let pieces = unpackAll(current);
+    // Un bloque anidado puede venir dentro de un literal (document.write('eval(…\'…\')')).
+    if (pieces.length === 0 && round > 0) pieces = unpackAll(unescapeJsLiteral(current));
+    if (pieces.length === 0) break;
+    current = pieces.join('\n');
+    output.push(current);
+  }
+
+  return output.join('\n');
+}
+
+/** Devuelve el documento invertido si contiene un ".m3u8" escrito al revés. */
+function reverseIfObfuscated(text) {
+  const s = String(text ?? '');
+  if (!REVERSED_M3U8_MARK.test(s)) return '';
+  return Array.from(s).reverse().join('');
+}
+
 /**
  * Convierte una URL (posiblemente relativa o "protocol-relative") en absoluta.
  *
@@ -418,8 +593,13 @@ export function absolutize(rawUrl, baseUrl) {
   let u = String(rawUrl ?? '').trim();
   if (!u) return null;
 
-  // Elimina puntuación sobrante pegada al final de la URL.
-  u = u.replace(/^[)\]}'"`<]+/, '').replace(/[.,;:)\]}'"`<]+$/, '');
+  // Elimina puntuación sobrante pegada al final de la URL. Un ")" final se
+  // conserva si cierra un "(" de la propia URL (Azure: manifest(format=m3u8-aapl)).
+  u = u.replace(/^[)\]}'"`<]+/, '');
+  const trimmed = u.replace(/[.,;:)\]}'"`<]+$/, '');
+  const opens = (trimmed.match(/\(/g) ?? []).length;
+  const closes = (trimmed.match(/\)/g) ?? []).length;
+  u = opens > closes && u.charAt(trimmed.length) === ')' ? `${trimmed})` : trimmed;
   if (!u) return null;
 
   // "//cdn.example.com/x.m3u8" → "https://cdn.example.com/x.m3u8"
@@ -435,36 +615,61 @@ export function absolutize(rawUrl, baseUrl) {
   }
 }
 
-/** Comprueba que una URL HTTP(S) apunte a un playlist HLS por extensión. */
-function isM3u8Url(rawUrl) {
+/**
+ * Comprueba que una URL HTTP(S) apunte a un playlist HLS.
+ * Acepta la extensión clásica (.m3u8/.m3u), rutas con ".m3u8/" intermedio,
+ * el formato de Azure Media Services "manifest(format=m3u8-aapl)" y queries
+ * que seleccionan HLS (?format=m3u8, ?type=hls, ?file=…m3u8).
+ */
+export function isHlsUrl(rawUrl) {
   try {
     const url = new URL(rawUrl);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
+
     let pathname = url.pathname;
     try {
       pathname = decodeURIComponent(pathname);
     } catch {
       // Un path parcialmente codificado sigue siendo evaluable sin decodificar.
     }
-    return url.protocol === 'http:' || url.protocol === 'https:'
-      ? pathname.toLowerCase().endsWith('.m3u8')
-      : false;
+    pathname = pathname.toLowerCase();
+    if (/\.m3u8?$/.test(pathname)) return true;
+    if (pathname.includes('.m3u8/') || pathname.includes('(format=m3u8')) return true;
+
+    const query = url.search.toLowerCase();
+    if (!query) return false;
+    // Si la query transporta otra URL (player?source=https://…m3u8) esto es un
+    // envoltorio, no la playlist: la URL interna se extrae por separado.
+    if (/(?:https?:|%3a%2f%2f|\/\/)/.test(query)) return false;
+    if (query.includes('m3u8')) return true;
+    return /[?&](?:format|type|output|protocol)=hls(?:$|&)/.test(query);
   } catch {
     return false;
   }
 }
+
+/** Compatibilidad: nombre histórico de la comprobación por extensión. */
+const isM3u8Url = isHlsUrl;
 
 /** Puntúa un candidato para ordenar los resultados de mayor a menor confianza. */
 function rankUrl(url, baseScore, sourceHost) {
   let score = baseScore;
   try {
     const u = new URL(url);
+    const pathname = u.pathname.toLowerCase();
     // Un CDN distinto del host del embed suele ser el stream real.
     if (u.hostname !== sourceHost) score += 5;
     // Nombres típicos de playlist maestra.
-    if (/master|index|playlist|chunklist|manifest/i.test(u.pathname)) score += 3;
+    if (/master|index|playlist|chunklist|manifest/i.test(pathname)) score += 3;
+    // La extensión explícita es más fiable que una fuente deducida por `type`.
+    if (/\.m3u8$/.test(pathname)) score += 2;
     // Señales de URL firmada: algunas CDNs concatenan el nombre del parámetro.
     if ([...u.searchParams.keys()].some((key) => /token|sign|signature|hash|expire|auth|policy|hdntl|key/i.test(key))) {
       score += 2;
+    }
+    // Avances, anuncios y muestras no son la película.
+    if (/(?:^|[\/._-])(?:preview|trailer|teaser|sample|ads?|advert\w*|promo|intro|bumper)(?:$|[\/._-])/i.test(pathname)) {
+      score -= 25;
     }
   } catch {
     /* no-op */
@@ -549,14 +754,20 @@ export function extractM3u8Urls(rawHtml, baseUrl, opts = {}) {
   const { clean, flat } = normalizeSource(rawHtml);
   const percentText = decodePercentText(clean);
   const percent = normalizeSource(percentText);
-  const firstBase64 = decodeBase64Payloads(`${clean}\n${percent.clean}\n${flat}`);
+  // Código p.a.c.k.e.r: el .m3u8 suele vivir dentro del payload empaquetado.
+  const unpacked = normalizeSource(unpackPackedJs(`${clean}\n${percent.clean}`));
+  const unpackedPercent = normalizeSource(decodePercentText(unpacked.clean));
+  const firstBase64 = decodeBase64Payloads(`${clean}\n${percent.clean}\n${flat}\n${unpacked.clean}`);
   const secondBase64 = decodeBase64Payloads(firstBase64, 24);
   const encoded = normalizeSource(decodePercentText(`${firstBase64}\n${secondBase64}`));
+  // Cadenas invertidas ("8u3m.retsam/…"): sólo si hay indicios, es costoso.
+  const reversed = normalizeSource(reverseIfObfuscated(`${clean}\n${unpacked.clean}\n${encoded.clean}`));
   const candidates = new Map(); // url → score
 
-  const add = (rawUrl, baseScore) => {
+  const add = (rawUrl, baseScore, typed = false) => {
     const abs = absolutize(rawUrl, baseUrl);
-    if (!abs || !isM3u8Url(abs)) return;
+    if (!abs) return;
+    if (!typed && !isHlsUrl(abs)) return;
     const score = rankUrl(abs, baseScore, sourceHost);
     // Nos quedamos siempre con la mejor puntuación de cada URL.
     if (!candidates.has(abs) || candidates.get(abs) < score) candidates.set(abs, score);
@@ -569,20 +780,26 @@ export function extractM3u8Urls(rawHtml, baseUrl, opts = {}) {
     { text: flat, bonus: 2 },
     { text: percent.clean, bonus: 7 },
     { text: percent.flat, bonus: 0 },
+    { text: unpacked.clean, bonus: 10 },
+    { text: unpacked.flat, bonus: 1 },
+    { text: unpackedPercent.clean, bonus: 6 },
+    { text: unpackedPercent.flat, bonus: -1 },
     { text: encoded.clean, bonus: 4 },
     { text: encoded.flat, bonus: -2 },
+    { text: reversed.clean, bonus: 3 },
+    { text: reversed.flat, bonus: -3 },
   ];
   const seenVariants = new Set();
 
   for (const { text, bonus } of variants) {
     if (!text || seenVariants.has(text)) continue;
     seenVariants.add(text);
-    for (const { re, score } of PATTERN_SCORES) {
+    for (const { re, score, typed } of PATTERN_SCORES) {
       re.lastIndex = 0; // las regex son /g: reseteamos el cursor
       let m;
       while ((m = re.exec(text)) !== null) {
         const captured = m[1] ?? m[0];
-        add(captured, score + bonus);
+        add(captured, score + bonus, Boolean(typed));
         if (re.lastIndex === m.index) re.lastIndex++; // evita bucles infinitos
       }
     }
@@ -662,8 +879,13 @@ export function findConfigUrls(rawHtml, baseUrl, opts = {}) {
     : LIMITS.maxConfigUrls;
   const { clean, flat } = normalizeSource(rawHtml);
   const percent = normalizeSource(decodePercentText(clean));
-  const decodedBase64 = normalizeSource(decodePercentText(decodeBase64Payloads(`${clean}\n${percent.clean}`)));
-  const texts = [...new Set([clean, flat, percent.clean, percent.flat, decodedBase64.clean, decodedBase64.flat])];
+  const unpacked = normalizeSource(unpackPackedJs(`${clean}\n${percent.clean}`));
+  const decodedBase64 = normalizeSource(
+    decodePercentText(decodeBase64Payloads(`${clean}\n${percent.clean}\n${unpacked.clean}`)),
+  );
+  const texts = [
+    ...new Set([clean, flat, percent.clean, percent.flat, unpacked.clean, unpacked.flat, decodedBase64.clean, decodedBase64.flat]),
+  ].filter(Boolean);
   const candidates = new Map();
   let order = 0;
 
@@ -691,6 +913,7 @@ export function findConfigUrls(rawHtml, baseUrl, opts = {}) {
     const endpointExtension = /\.(?:json|php|aspx?|do|txt|xml|m3u8)(?:$|\?)/i.test(`${pathname}${parsed.search}`);
     const isIframe = /<(?:iframe|frame)\b/i.test(contextText);
     const isMediaTag = /<(?:source|video|embed|object)\b/i.test(contextText);
+    const isRedirect = /^@redirect\b|http-equiv|\blocation\b/i.test(contextText);
     const isRequestCall = /\b(?:fetch|xmlhttprequest|axios|\.get\s*\(|\.post\s*\()/i.test(contextText);
     const extension = pathname.match(/\.([a-z0-9]{1,8})$/i)?.[1]?.toLowerCase() ?? '';
     const staticAsset = /^(?:css|png|jpe?g|gif|webp|svg|ico|woff2?|ttf|otf|mp4|m4v|webm|ts|m4s|mp3|aac)$/i.test(extension);
@@ -699,8 +922,8 @@ export function findConfigUrls(rawHtml, baseUrl, opts = {}) {
     // No descargamos imágenes, estilos, fuentes, ni segmentos multimedia. Un
     // JS sólo se sigue cuando su nombre indica que contiene el reproductor.
     if (staticAsset || (extension === 'js' && !relevantScript)) return;
-    if (parsed.pathname === '/' && !pathHints && !endpointExtension) return;
-    if (!pathHints && !endpointExtension && !isIframe && !isMediaTag && !isRequestCall && !relevantScript) return;
+    if (parsed.pathname === '/' && !pathHints && !endpointExtension && !isRedirect) return;
+    if (!pathHints && !endpointExtension && !isIframe && !isMediaTag && !isRequestCall && !relevantScript && !isRedirect) return;
 
     let score = 0;
     if (pathHints) score += 35;
@@ -709,6 +932,8 @@ export function findConfigUrls(rawHtml, baseUrl, opts = {}) {
     if (isMediaTag) score += 20;
     if (isRequestCall) score += 25;
     if (relevantScript) score += 15;
+    // Una redirección estática es, casi siempre, la página real del player.
+    if (isRedirect) score += 40;
     try {
       if (new URL(baseUrl).hostname === parsed.hostname) score += 5;
     } catch {
@@ -724,6 +949,20 @@ export function findConfigUrls(rawHtml, baseUrl, opts = {}) {
   };
 
   for (const text of texts) {
+    // Redirecciones estáticas: <meta http-equiv="refresh"> y location.href = "…".
+    META_REFRESH_RE.lastIndex = 0;
+    let refreshMatch;
+    while ((refreshMatch = META_REFRESH_RE.exec(text)) !== null) {
+      add(refreshMatch[1], `@redirect ${refreshMatch[0]}`);
+      if (META_REFRESH_RE.lastIndex === refreshMatch.index) META_REFRESH_RE.lastIndex++;
+    }
+    LOCATION_REDIRECT_RE.lastIndex = 0;
+    let locationMatch;
+    while ((locationMatch = LOCATION_REDIRECT_RE.exec(text)) !== null) {
+      add(locationMatch[1] ?? locationMatch[2], `@redirect ${locationMatch[0]}`);
+      if (LOCATION_REDIRECT_RE.lastIndex === locationMatch.index) LOCATION_REDIRECT_RE.lastIndex++;
+    }
+
     TAG_URL_RE.lastIndex = 0;
     let tagMatch;
     while ((tagMatch = TAG_URL_RE.exec(text)) !== null) {
@@ -822,9 +1061,11 @@ export function buildManifest(env) {
  * @param {number} index   posición del candidato (0 = principal)
  * @param {URL} workerUrl URL del propio Worker (para el modo proxy)
  * @param {object} env    variables de entorno
+ * @param {object} source proveedor (cabeceras y nombre)
+ * @param {{quality?: string, live?: boolean}} [meta] datos de la playlist verificada
  * @returns {object}
  */
-function buildStream(m3u8Url, index, workerUrl, env, source) {
+function buildStream(m3u8Url, index, workerUrl, env, source, meta = {}) {
   const useProxy = envFlag(env?.PROXY_HLS, false);
   const notWebReady = useProxy ? false : envFlag(env?.NOT_WEB_READY, true);
 
@@ -832,9 +1073,11 @@ function buildStream(m3u8Url, index, workerUrl, env, source) {
   proxyUrl.searchParams.set('url', m3u8Url);
   const finalUrl = useProxy ? proxyUrl.toString() : m3u8Url;
 
-  const title = index === 0
-    ? `${source.name} [HLS]`
-    : `${source.name} [HLS · Alt ${index + 1}]`;
+  const tags = ['HLS'];
+  if (meta?.quality) tags.push(meta.quality);
+  if (meta?.live) tags.push('LIVE');
+  if (index > 0) tags.push(`Alt ${index + 1}`);
+  const title = `${source.name} [${tags.join(' · ')}]`;
 
   return {
     name: ADDON.name,
@@ -956,7 +1199,7 @@ async function resolveProviderUrls(source, kind, coordinates, workerUrl, env, ma
           deepScanBudget--;
 
           try {
-            const page = await fetchText(next.url, scrapeHeaders(source, next.referer));
+            const page = await fetchText(next.url, deepScanHeaders(source, next.url, next.referer));
             const pageUrl = page.response.url || next.url;
             urls = extractM3u8Urls(page.body, pageUrl, { max: maxStreams * 4 });
             if (urls.length === 0) {
@@ -984,7 +1227,7 @@ async function resolveProviderUrls(source, kind, coordinates, workerUrl, env, ma
       if (scanError) lastError = scanError;
       if (urls.length > 0) {
         const checked = await verifyHlsCandidates(source, urls, maxStreams, env);
-        if (checked.urls.length > 0) return { urls: checked.urls, error: null };
+        if (checked.urls.length > 0) return { urls: checked.urls, meta: checked.meta, error: null };
         if (checked.error) lastError = checked.error;
       }
     } catch (err) {
@@ -992,29 +1235,63 @@ async function resolveProviderUrls(source, kind, coordinates, workerUrl, env, ma
     }
   }
 
-  return { urls: [], error: lastError };
+  return { urls: [], meta: new Map(), error: lastError };
 }
 
-/** Pide la playlist con las cabeceras del proveedor para detectar HLS caducado. */
-async function verifyHlsCandidates(source, urls, maxStreams, env) {
-  if (!envFlag(env?.VERIFY_HLS, true)) return { urls, error: null };
+/**
+ * Lee de una playlist la información útil para etiquetar el stream.
+ * - master: resolución máxima declarada en #EXT-X-STREAM-INF → "1080p".
+ * - media : nº de variantes = 0; se detecta si es un directo (#EXT-X-ENDLIST).
+ *
+ * @param {string} body contenido de la playlist (ya validado como #EXTM3U)
+ * @returns {{quality: string, variants: number, live: boolean}}
+ */
+export function describePlaylist(body) {
+  const text = String(body ?? '');
+  let maxHeight = 0;
+  let variants = 0;
 
-  const verified = [];
-  let lastError = null;
-  for (const candidate of urls.slice(0, maxStreams)) {
+  const streamInfRe = /#EXT-X-STREAM-INF:([^\r\n]*)/gi;
+  let m;
+  while ((m = streamInfRe.exec(text)) !== null) {
+    variants++;
+    const resolution = m[1].match(/RESOLUTION\s*=\s*(\d+)\s*x\s*(\d+)/i);
+    if (resolution) maxHeight = Math.max(maxHeight, Number(resolution[2]));
+  }
+
+  const quality = maxHeight >= 2160
+    ? '4K'
+    : maxHeight > 0
+      ? `${maxHeight}p`
+      : '';
+  const live = variants === 0 && !/#EXT-X-ENDLIST/i.test(text) && /#EXTINF/i.test(text);
+  return { quality, variants, live };
+}
+
+/**
+ * Pide cada playlist (en paralelo) con las cabeceras del proveedor para
+ * detectar HLS caducado o páginas HTML disfrazadas, y aprovecha el cuerpo para
+ * etiquetar la calidad. Conserva el orden de confianza de los candidatos.
+ *
+ * @returns {Promise<{urls: string[], meta: Map<string, object>, error: Error|null}>}
+ */
+async function verifyHlsCandidates(source, urls, maxStreams, env) {
+  if (!envFlag(env?.VERIFY_HLS, true)) return { urls, meta: new Map(), error: null };
+
+  const verifyOne = async (candidate) => {
     let parsed;
     try {
       parsed = new URL(candidate);
     } catch {
-      lastError = new Error('invalid-hls-url');
-      lastError.code = 'invalid-hls-url';
-      continue;
+      const error = new Error('invalid-hls-url');
+      error.code = 'invalid-hls-url';
+      return { error };
     }
 
     if (!isSafeScanTarget(parsed, `${source.origin}/`)) {
-      lastError = new Error('unsafe-hls-url');
-      lastError.code = 'unsafe-hls-url';
-      continue;
+      const error = new Error('unsafe-hls-url');
+      error.code = 'unsafe-hls-url';
+      return { error };
     }
 
     try {
@@ -1026,18 +1303,38 @@ async function verifyHlsCandidates(source, urls, maxStreams, env) {
       if (!body.startsWith('#EXTM3U')) {
         const error = new Error('La URL extraída no devolvió una playlist HLS válida');
         error.code = 'invalid-hls';
-        lastError = error;
-        continue;
+        return { error };
       }
 
       const finalUrl = absolutize(result.response.url || candidate, candidate);
-      if (finalUrl) verified.push(finalUrl);
-    } catch (err) {
-      lastError = err;
+      if (!finalUrl) {
+        const error = new Error('invalid-hls-url');
+        error.code = 'invalid-hls-url';
+        return { error };
+      }
+      return { url: finalUrl, meta: describePlaylist(body) };
+    } catch (error) {
+      return { error };
+    }
+  };
+
+  const outcomes = await Promise.all(urls.slice(0, maxStreams).map(verifyOne));
+
+  const verified = [];
+  const meta = new Map();
+  let lastError = null;
+  for (const outcome of outcomes) {
+    if (outcome.url) {
+      if (!meta.has(outcome.url)) {
+        verified.push(outcome.url);
+        meta.set(outcome.url, outcome.meta);
+      }
+    } else if (outcome.error) {
+      lastError = outcome.error;
     }
   }
 
-  return { urls: verified, error: verified.length > 0 ? null : lastError };
+  return { urls: verified, meta, error: verified.length > 0 ? null : lastError };
 }
 
 /**
@@ -1077,7 +1374,7 @@ async function handleStream(rawId, type, request, env) {
   if (result.urls.length > 0) {
     const streams = result.urls
       .slice(0, maxStreams)
-      .map((url, index) => buildStream(url, index, workerUrl, env, source));
+      .map((url, index) => buildStream(url, index, workerUrl, env, source, result.meta?.get(url)));
 
     return jsonResponse({ streams }, 200, {
       'X-Source-Id': coordinates.id,

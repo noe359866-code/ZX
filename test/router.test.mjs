@@ -585,6 +585,134 @@ test('PROXY_HLS=1: la URL apunta a la pasarela del Worker', async () => {
 });
 
 // ---------------------------------------------------------------------------
+// Mejoras del extractor y del deep scan (integración)
+// ---------------------------------------------------------------------------
+test('VERIFY_HLS: etiqueta la calidad leyendo la master playlist', async () => {
+  const master = [
+    '#EXTM3U',
+    '#EXT-X-STREAM-INF:BANDWIDTH=1000000,RESOLUTION=1280x720', '720.m3u8',
+    '#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1920x1080', '1080.m3u8',
+  ].join('\n');
+  mockFetch((url) => {
+    if (url === EMBED_URL) return htmlResponse('<script>p({file:"https://cdn.vimeus.test/master.m3u8"})</script>');
+    if (url === 'https://cdn.vimeus.test/master.m3u8') {
+      return new Response(master, { status: 200, headers: { 'Content-Type': 'application/vnd.apple.mpegurl' } });
+    }
+    throw new Error(`petición inesperada: ${url}`);
+  });
+
+  const res = await worker.fetch(new Request(`${WORKER_URL}/stream/movie/tt1234567.json`), { VERIFY_HLS: '1' }, {});
+  const { streams } = await res.json();
+  assert.equal(streams[0].title, 'Vimeus [HLS · 1080p]');
+});
+
+test('VERIFY_HLS: marca LIVE en una media playlist sin ENDLIST', async () => {
+  mockFetch((url) => {
+    if (url === EMBED_URL) return htmlResponse('<script>p({file:"https://cdn.vimeus.test/live.m3u8"})</script>');
+    return new Response('#EXTM3U\n#EXTINF:4,\nseg.ts\n', { status: 200 });
+  });
+  const res = await worker.fetch(new Request(`${WORKER_URL}/stream/movie/tt1234567.json`), { VERIFY_HLS: '1' }, {});
+  const { streams } = await res.json();
+  assert.equal(streams[0].title, 'Vimeus [HLS · LIVE]');
+});
+
+test('VERIFY_HLS: verifica en paralelo y conserva el orden de confianza', async () => {
+  const order = [];
+  mockFetch((url) => {
+    if (url === EMBED_URL) {
+      return htmlResponse(`
+        <script>a({file:"https://c1.example.net/slow.m3u8"});</script>
+        <script>var alt = "https://c2.example.net/fast.m3u8";</script>`);
+    }
+    order.push(url);
+    const delay = url.includes('slow') ? 40 : 1;
+    return new Promise((resolve) =>
+      setTimeout(() => resolve(new Response('#EXTM3U\n#EXTINF:4,\nx.ts\n#EXT-X-ENDLIST', { status: 200 })), delay),
+    );
+  });
+
+  const t0 = Date.now();
+  const res = await worker.fetch(new Request(`${WORKER_URL}/stream/movie/tt1234567.json`), { VERIFY_HLS: '1' }, {});
+  const { streams } = await res.json();
+  assert.deepEqual(streams.map((s) => s.url), ['https://c1.example.net/slow.m3u8', 'https://c2.example.net/fast.m3u8']);
+  assert.equal(order.length, 2, 'ambas playlists se solicitan');
+  assert.ok(Date.now() - t0 < 200, 'las verificaciones no se encadenan en serie');
+});
+
+test('deep scan: endpoints de API reciben cabeceras XHR; los iframes, cabeceras de documento', async () => {
+  const seen = {};
+  mockFetch((url, init) => {
+    seen[url] = init.headers;
+    if (url === EMBED_URL) return htmlResponse('<iframe src="/embed/inner"></iframe>');
+    if (url === 'https://vimeus.com/embed/inner') return htmlResponse('<script>fetch("/api/source/tt1234567")</script>');
+    if (url === 'https://vimeus.com/api/source/tt1234567') {
+      return new Response(JSON.stringify({ file: 'https://cdn.vimeus.test/x/master.m3u8' }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      });
+    }
+    throw new Error(`petición inesperada: ${url}`);
+  });
+
+  const res = await call('/stream/movie/tt1234567.json');
+  const { streams } = await res.json();
+  assert.equal(streams[0].url, 'https://cdn.vimeus.test/x/master.m3u8');
+
+  const iframeHeaders = seen['https://vimeus.com/embed/inner'];
+  assert.equal(iframeHeaders['Sec-Fetch-Dest'], 'iframe');
+  assert.equal(iframeHeaders['X-Requested-With'], undefined);
+  assert.equal(iframeHeaders.Referer, EMBED_URL);
+
+  const apiHeaders = seen['https://vimeus.com/api/source/tt1234567'];
+  assert.equal(apiHeaders['X-Requested-With'], 'XMLHttpRequest');
+  assert.match(apiHeaders.Accept, /^application\/json/);
+  assert.equal(apiHeaders['Sec-Fetch-Mode'], 'cors');
+  assert.equal(apiHeaders.Referer, 'https://vimeus.com/embed/inner');
+});
+
+test('deep scan: sigue una redirección por meta refresh hasta el player', async () => {
+  const calls = mockFetch((url) => {
+    if (url === EMBED_URL) return htmlResponse('<meta http-equiv="refresh" content="0; url=/watch/real?id=tt1234567">');
+    if (url === 'https://vimeus.com/watch/real?id=tt1234567') {
+      return htmlResponse('<script>p({file:"https://cdn.vimeus.test/real/master.m3u8"})</script>');
+    }
+    throw new Error(`petición inesperada: ${url}`);
+  });
+  const res = await call('/stream/movie/tt1234567.json');
+  const { streams } = await res.json();
+  assert.equal(streams[0].url, 'https://cdn.vimeus.test/real/master.m3u8');
+  assert.equal(calls.length, 2);
+});
+
+test('embed con script empaquetado (p.a.c.k.e.r): se extrae el HLS sin ejecutar JS', async () => {
+  // Fixture real generado con el packer de Dean Edwards en base 62.
+  const packed =
+    "eval(function(p,a,c,k,e,d){e=function(c){return(c<a?'':e(parseInt(c/a)))+((c=c%a)>35?String.fromCharCode(c+29):c.toString(36))};" +
+    "if(!''.replace(/^/,String)){while(c--){d[e(c)]=k[c]||e(c)}k=[function(e){return d[e]}];e=function(){return'\\w+'};c=1};" +
+    "while(c--){if(k[c]){p=p.replace(new RegExp('\\b'+e(c)+'\\b','g'),k[c])}}return p}" +
+    "('0 1=2(\"3\");1.4({5:[{6:\"7://8.9.a/b/c/d.e?f=g\",h:\"b\"}],i:\"/j.k\"});',21,21," +
+    "'var|player|jwplayer|vplayer|setup|sources|file|https|cdn-packed|example|net|hls|abc123|master|m3u8|token|p4ck3d|type|image|poster|jpg'.split('|'),0,{}))";
+  mockFetch(() => htmlResponse(`<html><body><div id="vplayer"></div><script>${packed}</script></body></html>`));
+  const res = await call('/stream/movie/tt1234567.json');
+  const { streams } = await res.json();
+  assert.equal(streams.length, 1);
+  assert.equal(streams[0].url, 'https://cdn-packed.example.net/hls/abc123/master.m3u8?token=p4ck3d');
+});
+
+test('embed con fuente HLS sin extensión .m3u8 (type: application/x-mpegURL)', async () => {
+  mockFetch((url) => {
+    if (url === EMBED_URL) {
+      return htmlResponse('<script>p.setup({sources:[{src:"https://cdn.vimeus.test/vod/777/stream",type:"application/x-mpegURL"}]})</script>');
+    }
+    if (url === 'https://cdn.vimeus.test/vod/777/stream') return new Response('#EXTM3U\n#EXTINF:4,\nx.ts\n#EXT-X-ENDLIST', { status: 200 });
+    throw new Error(`petición inesperada: ${url}`);
+  });
+  const res = await worker.fetch(new Request(`${WORKER_URL}/stream/movie/tt1234567.json`), { VERIFY_HLS: '1' }, {});
+  const { streams } = await res.json();
+  assert.equal(streams[0].url, 'https://cdn.vimeus.test/vod/777/stream');
+  assert.equal(streams[0].type, 'hls');
+});
+
+// ---------------------------------------------------------------------------
 // /proxy — pasarela HLS
 // ---------------------------------------------------------------------------
 test('/proxy: reescribe un playlist hacia el propio Worker con cabeceras Vimeus', async () => {

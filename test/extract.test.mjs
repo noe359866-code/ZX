@@ -15,6 +15,9 @@ import {
   buildManifest,
   resolveVimeusSource,
   resolveSource,
+  unpackPackedJs,
+  isHlsUrl,
+  describePlaylist,
 } from '../src/index.js';
 
 const BASE = 'https://vimeus.com/e/movie?imdb=tt1234567&view_key=test-key';
@@ -400,4 +403,141 @@ test('resolveVimeusSource: sobrescribible por variables de entorno', () => {
   const series = source.embedUrlsFor('series', 'tt1', 2, 4).map((value) => new URL(value));
   assert.deepEqual(series.map((url) => url.pathname), ['/embed/show', '/embed/anime']);
   assert.throws(() => source.embedUrlsFor('series', 'tt1', 1, 0), /temporada y episodio/);
+});
+
+// ---------------------------------------------------------------------------
+// Extractor: ofuscaciones y HLS sin extensión
+// ---------------------------------------------------------------------------
+
+/** Empaquetador p.a.c.k.e.r fiel al original (sólo para generar fixtures). */
+function packJs(src, radix = 62) {
+  const enc = (c) =>
+    (c < radix ? '' : enc(Math.floor(c / radix))) +
+    ((c = c % radix) > 35 ? String.fromCharCode(c + 29) : c.toString(36));
+  const words = [...new Set(src.match(/\b\w+\b/g))];
+  const payload = src.replace(/\b\w+\b/g, (w) => enc(words.indexOf(w)));
+  const keywords = words.map((w, i) => (enc(i) === w ? '' : w));
+  const esc = (v) => v.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+  return (
+    "eval(function(p,a,c,k,e,d){e=function(c){return(c<a?'':e(parseInt(c/a)))+((c=c%a)>35?String.fromCharCode(c+29):c.toString(36))};" +
+    "if(!''.replace(/^/,String)){while(c--){d[e(c)]=k[c]||e(c)}k=[function(e){return d[e]}];e=function(){return'\\\\w+'};c=1};" +
+    "while(c--){if(k[c]){p=p.replace(new RegExp('\\\\b'+e(c)+'\\\\b','g'),k[c])}}return p}" +
+    `('${esc(payload)}',${radix},${keywords.length},'${esc(keywords.join('|'))}'.split('|'),0,{}))`
+  );
+}
+
+const PACKED_SOURCE =
+  'var player=jwplayer("vplayer");player.setup({sources:[{file:"https://cdn-packed.example.net/hls/abc123/master.m3u8?token=p4ck3d",type:"hls"}],image:"/poster.jpg"});';
+
+test('unpackPackedJs: desempaqueta p.a.c.k.e.r en base 62 y 36', () => {
+  for (const radix of [62, 36]) {
+    const unpacked = unpackPackedJs(`<script>${packJs(PACKED_SOURCE, radix)}</script>`);
+    assert.ok(unpacked.includes('cdn-packed.example.net/hls/abc123/master.m3u8?token=p4ck3d'), `radix ${radix}`);
+  }
+  assert.equal(unpackPackedJs('<script>var a = 1;</script>'), '');
+});
+
+test('unpackPackedJs: resuelve bloques anidados', () => {
+  const inner = packJs(PACKED_SOURCE);
+  const outer = packJs(`document.write('${inner.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}');`);
+  assert.ok(unpackPackedJs(outer).includes('cdn-packed.example.net/hls/abc123/master.m3u8'));
+});
+
+test('extract: encuentra el .m3u8 dentro de un script empaquetado', () => {
+  const html = `<html><body><div id="vplayer"></div><script>${packJs(PACKED_SOURCE)}</script></body></html>`;
+  assert.deepEqual(extractM3u8Urls(html, BASE), [
+    'https://cdn-packed.example.net/hls/abc123/master.m3u8?token=p4ck3d',
+  ]);
+});
+
+test('extract: URL escrita al revés (split/reverse/join)', () => {
+  const reversed = [...'https://cdn-rev.example.net/live/index.m3u8?sig=1'].reverse().join('');
+  const html = `<script>var s="${reversed}".split("").reverse().join("");hls.loadSource(s);</script>`;
+  assert.deepEqual(extractM3u8Urls(html, BASE), ['https://cdn-rev.example.net/live/index.m3u8?sig=1']);
+});
+
+test('extract: fuente HLS sin extensión identificada por type', () => {
+  const js = `<script>p.setup({sources:[
+    {src:"https://cdn-typed.example.net/vod/12345/stream",type:"application/x-mpegURL"},
+    {src:"https://cdn-typed.example.net/vod/12345.mp4",type:"video/mp4"}
+  ]})</script>`;
+  assert.deepEqual(extractM3u8Urls(js, BASE), ['https://cdn-typed.example.net/vod/12345/stream']);
+
+  const html = '<video><source type="application/vnd.apple.mpegurl" src="/hls/live/manifest"></video>';
+  assert.deepEqual(extractM3u8Urls(html, BASE), ['https://vimeus.com/hls/live/manifest']);
+
+  const typeFirst = '<script>var cfg={type:"hls",file:"https://cdn-typed.example.net/x/playlist"}</script>';
+  assert.deepEqual(extractM3u8Urls(typeFirst, BASE), ['https://cdn-typed.example.net/x/playlist']);
+});
+
+test('extract: HLS seleccionado por query o formato Azure', () => {
+  const html = `<script>
+    var a="https://cdn-q.example.net/manifest?format=m3u8";
+    var b="https://ams.example.net/x/manifest(format=m3u8-aapl)";
+    var c="https://cdn-q.example.net/manifest?format=mp4";
+    var d="https://cdn-q.example.net/p?type=hls";
+  </script>`;
+  const urls = extractM3u8Urls(html, BASE);
+  assert.ok(urls.includes('https://cdn-q.example.net/manifest?format=m3u8'));
+  assert.ok(urls.includes('https://ams.example.net/x/manifest(format=m3u8-aapl)'));
+  assert.ok(urls.includes('https://cdn-q.example.net/p?type=hls'));
+  assert.ok(!urls.some((u) => u.includes('format=mp4')));
+});
+
+test('extract: trailers/previews quedan por detrás de la película', () => {
+  const html = `<script>
+    a({file:"https://cdn.example.net/preview/trailer.m3u8"});
+    b({file:"https://cdn.example.net/movie/master.m3u8"});
+  </script>`;
+  assert.deepEqual(extractM3u8Urls(html, BASE), [
+    'https://cdn.example.net/movie/master.m3u8',
+    'https://cdn.example.net/preview/trailer.m3u8',
+  ]);
+});
+
+test('isHlsUrl: extensiones, rutas intermedias, query y envoltorios', () => {
+  assert.equal(isHlsUrl('https://a.b/x.m3u8'), true);
+  assert.equal(isHlsUrl('https://a.b/x.M3U8?t=1'), true);
+  assert.equal(isHlsUrl('https://a.b/x.m3u'), true);
+  assert.equal(isHlsUrl('https://a.b/x.m3u8/segment'), true);
+  assert.equal(isHlsUrl('https://a.b/manifest(format=m3u8-aapl)'), true);
+  assert.equal(isHlsUrl('https://a.b/p?type=hls'), true);
+  assert.equal(isHlsUrl('https://a.b/p?file=master.m3u8'), true);
+  assert.equal(isHlsUrl('https://a.b/p?type=hlsx'), false);
+  assert.equal(isHlsUrl('https://a.b/player?source=https://c.d/x.m3u8'), false, 'envoltorio de otra URL');
+  assert.equal(isHlsUrl('https://a.b/player?src=https%3A%2F%2Fc.d%2Fx.m3u8'), false);
+  assert.equal(isHlsUrl('https://a.b/video.mp4'), false);
+  assert.equal(isHlsUrl('ftp://a.b/video.m3u8'), false);
+});
+
+test('absolutize: conserva un ")" que cierra un "(" de la URL', () => {
+  assert.equal(absolutize('https://a.b/x/manifest(format=m3u8-aapl)', BASE), 'https://a.b/x/manifest(format=m3u8-aapl)');
+  assert.equal(absolutize('https://a.b/x/master.m3u8)', BASE), 'https://a.b/x/master.m3u8');
+  assert.equal(absolutize('https://a.b/x/master.m3u8").', BASE), 'https://a.b/x/master.m3u8');
+});
+
+test('findConfigUrls: sigue meta refresh y location.href', () => {
+  const html = `<meta http-equiv="refresh" content="0;url=/player/real?id=1">
+    <script>window.location.href = "https://player.example.net/v/abc";</script>
+    <script>top.location.replace('/go/next');</script>`;
+  const urls = findConfigUrls(html, BASE);
+  assert.equal(urls[0], 'https://vimeus.com/player/real?id=1');
+  assert.ok(urls.includes('https://player.example.net/v/abc'));
+  assert.ok(urls.includes('https://vimeus.com/go/next'));
+});
+
+test('findConfigUrls: lee URLs de API dentro de código empaquetado', () => {
+  const packed = packJs('fetch("/api/source/tt777").then(function(r){return r.json()});');
+  const urls = findConfigUrls(`<script>${packed}</script>`, BASE);
+  assert.ok(urls.includes('https://vimeus.com/api/source/tt777'));
+});
+
+test('describePlaylist: calidad máxima, variantes y directo', () => {
+  const master = ['#EXTM3U',
+    '#EXT-X-STREAM-INF:BANDWIDTH=1000000,RESOLUTION=1280x720', '720.m3u8',
+    '#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1920x1080', '1080.m3u8'].join('\n');
+  assert.deepEqual(describePlaylist(master), { quality: '1080p', variants: 2, live: false });
+  assert.equal(describePlaylist('#EXTM3U\n#EXT-X-STREAM-INF:RESOLUTION=3840x2160\nuhd.m3u8').quality, '4K');
+  assert.deepEqual(describePlaylist('#EXTM3U\n#EXTINF:4,\nseg.ts\n'), { quality: '', variants: 0, live: true });
+  assert.deepEqual(describePlaylist('#EXTM3U\n#EXTINF:4,\nseg.ts\n#EXT-X-ENDLIST'), { quality: '', variants: 0, live: false });
 });

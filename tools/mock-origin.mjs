@@ -14,6 +14,7 @@
  *    GET /e/movie?imdb=tt1234567&view_key=… → JWPlayer con el .m3u8 escapado
  *    GET /e/movie?imdb=tt9999999&view_key=… → deep-scan: el .m3u8 viene de /api
  *    GET /e/movie?imdb=tt0000000&view_key=… → HTML sin ningún .m3u8
+ *    GET /e/movie?imdb=tt5555555&view_key=… → script ofuscado con p.a.c.k.e.r
  *    GET /e/serie|/e/anime?tmdb=…&se=&ep=   → episodios (mismo fixture JWPlayer)
  *    GET /api/source/tt9999999              → JSON con la URL del stream
  *    GET /hls/.../*.m3u8                    → playlists (exigen Referer, si no → 403)
@@ -88,6 +89,31 @@ const deepScanApi = (req) =>
 /** Escenario 3 — página sin stream (debe producir {"streams": []}). */
 const embedEmpty = () => `<!doctype html><html><body><p>Contenido no disponible</p></body></html>`;
 
+/**
+ * Escenario 4 — configuración del player ofuscada con el packer de Dean
+ * Edwards (eval(function(p,a,c,k,e,d){…})). El Worker la desempaqueta como
+ * texto, sin ejecutar JavaScript.
+ */
+function packJs(src, radix = 62) {
+  const enc = (c) =>
+    (c < radix ? '' : enc(Math.floor(c / radix))) +
+    ((c = c % radix) > 35 ? String.fromCharCode(c + 29) : c.toString(36));
+  const words = [...new Set(src.match(/\b\w+\b/g))];
+  const payload = src.replace(/\b\w+\b/g, (w) => enc(words.indexOf(w)));
+  const keywords = words.map((w, i) => (enc(i) === w ? '' : w));
+  const esc = (v) => v.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+  return (
+    "eval(function(p,a,c,k,e,d){e=function(c){return(c<a?'':e(parseInt(c/a)))+((c=c%a)>35?String.fromCharCode(c+29):c.toString(36))};" +
+    "if(!''.replace(/^/,String)){while(c--){d[e(c)]=k[c]||e(c)}k=[function(e){return d[e]}];e=function(){return'\\\\w+'};c=1};" +
+    "while(c--){if(k[c]){p=p.replace(new RegExp('\\\\b'+e(c)+'\\\\b','g'),k[c])}}return p}" +
+    `('${esc(payload)}',${radix},${keywords.length},'${esc(keywords.join('|'))}'.split('|'),0,{}))`
+  );
+}
+const embedPacked = (req) => `<!doctype html>
+<html><body><div id="vplayer"></div>
+<script>${packJs(`var player=jwplayer("vplayer");player.setup({sources:[{file:"${cdnBase(req)}/hls/tt5555555/master.m3u8?token=packed",type:"hls"}]});`)}</script>
+</body></html>`;
+
 /** Mock del embed Vimeus; requiere la clave de prueba local, no una clave real. */
 const VIMEUS_MOCK_VIEW_KEY = 'local-test-key';
 const embedVimeus = (req, res) => {
@@ -99,6 +125,7 @@ const embedVimeus = (req, res) => {
   const id = url.searchParams.get('imdb') || url.searchParams.get('tmdb');
   if (id === 'tt0000000' || id === '0') return send(res, 200, embedEmpty());
   if (id === 'tt9999999') return send(res, 200, embedDeepScan(req));
+  if (id === 'tt5555555') return send(res, 200, embedPacked(req));
   return send(res, 200, embedJwplayer(req));
 };
 
@@ -192,4 +219,5 @@ server.listen(PORT, HOST, () => {
   console.log(`[mock-origin] embed HLS   → http://${HOST}:${PORT}/e/movie?imdb=tt1234567&view_key=${VIMEUS_MOCK_VIEW_KEY}`);
   console.log(`[mock-origin] embed deep  → http://${HOST}:${PORT}/e/movie?imdb=tt9999999&view_key=${VIMEUS_MOCK_VIEW_KEY}`);
   console.log(`[mock-origin] embed vacío → http://${HOST}:${PORT}/e/movie?imdb=tt0000000&view_key=${VIMEUS_MOCK_VIEW_KEY}`);
+  console.log(`[mock-origin] embed packed→ http://${HOST}:${PORT}/e/movie?imdb=tt5555555&view_key=${VIMEUS_MOCK_VIEW_KEY}`);
 });
