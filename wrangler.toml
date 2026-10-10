@@ -4,6 +4,8 @@
 #  Workers (Create Worker) y pegar las variables de [vars] en Settings.
 # ============================================================================
 
+# Se conserva el nombre del Worker para no cambiar la URL *.workers.dev que ya
+# tienen instalada los usuarios del addon.
 name = "unlimplay-proxy-stream"
 main = "src/index.js"
 compatibility_date = "2025-09-01"
@@ -16,24 +18,29 @@ compatibility_flags = ["nodejs_compat"]
 enabled = true
 
 [vars]
-# Vimeus se intenta primero; UnlimPlay sólo si falla/no devuelve HLS.
-PROVIDER_ORDER = "vimeus,unlimplay"
+# Vimeus es el único proveedor del addon.
 VIMEUS_ORIGIN = "https://vimeus.com"
-UNLIMPLAY_ORIGIN = "https://unlimplay.com"
 
 # Si la view_key está limitada por dominio, configura aquí el referer/origen permitido.
-# No guardes VIMEUS_VIEW_KEY en este archivo: configúrala como secreto de Wrangler.
+# VIMEUS_REFERER = "https://vimeus.com/"
+
+# No guardes VIMEUS_VIEW_KEY en este archivo: configúrala como secreto de Wrangler:
+#   npx wrangler secret put VIMEUS_VIEW_KEY
+
+# Rutas del embed de Vimeus (valores por defecto).
+# VIMEUS_MOVIE_PATH = "/e/movie"
+# VIMEUS_SERIES_PATHS = "/e/serie,/e/anime"
 
 # "1" → el stream apunta a la pasarela HLS del Worker (necesario en Stremio Web).
 # "0" → devuelve la URL .m3u8 directa con behaviorHints.requestHeaders (default).
 PROXY_HLS = "0"
 
 # "1" → comprueba que el candidato responda una playlist #EXTM3U antes de
-# elegir el proveedor; si no, continúa con el respaldo.
+# devolverlo a Stremio.
 VERIFY_HLS = "1"
 
 # "1" → si el HTML del embed no trae el .m3u8, sigue iframes/configuración
-# del reproductor (máximo 4 peticiones extra por proveedor).
+# del reproductor (máximo 4 peticiones extra).
 DEEP_SCAN = "1"
 
 # Nº máximo de candidatos .m3u8 devueltos como streams alternativos.
@@ -42,10 +49,6 @@ MAX_STREAMS = "3"
 # "1" → marca el stream como no reproducible en navegador cuando depende de
 # cabeceras propias (Referer). En modo PROXY_HLS se ignora.
 NOT_WEB_READY = "1"
-
-# Rutas de embed documentadas para películas y episodios.
-EMBED_PATH = "/f/embed/movie/"
-TV_EMBED_PATH = "/f/embed/tv/"
 
 # Descomenta para fijar un dominio propio:
 # routes = [

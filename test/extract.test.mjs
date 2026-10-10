@@ -13,11 +13,11 @@ import {
   findConfigUrls,
   rewritePlaylist,
   buildManifest,
-  resolveProviderOrder,
   resolveVimeusSource,
+  resolveSource,
 } from '../src/index.js';
 
-const BASE = 'https://unlimplay.com/f/embed/movie/tt1234567';
+const BASE = 'https://vimeus.com/e/movie?imdb=tt1234567&view_key=test-key';
 
 // ---------------------------------------------------------------------------
 // cleanId
@@ -72,7 +72,7 @@ test('normalizeSource: une concatenaciones JS en la variante flat', () => {
 // ---------------------------------------------------------------------------
 test('absolutize: resuelve relativas y protocol-relative', () => {
   assert.equal(absolutize('//cdn.example.com/a.m3u8', BASE), 'https://cdn.example.com/a.m3u8');
-  assert.equal(absolutize('/hls/a.m3u8', BASE), 'https://unlimplay.com/hls/a.m3u8');
+  assert.equal(absolutize('/hls/a.m3u8', BASE), 'https://vimeus.com/hls/a.m3u8');
   assert.equal(
     absolutize('a.m3u8', 'https://cdn.example.com/hls/index.html'),
     'https://cdn.example.com/hls/a.m3u8',
@@ -89,13 +89,13 @@ const FIXTURES = {
   jwplayer: `
     <script>
       jwplayer("player").setup({
-        sources: [{ file: "https:\\/\\/cdn.unlimplay.com\\/hls\\/tt1234567\\/master.m3u8?token=abc123",
+        sources: [{ file: "https:\\/\\/cdn.vimeus.test\\/hls\\/tt1234567\\/master.m3u8?token=abc123",
                     type: "application/x-mpegURL" }],
         image: "/poster.jpg"
       });
     </script>`,
 
-  plyr: `<div id="player" data-source='{"sources":[{"src":"//cdn2.unlimplay.video/v/abc/index.m3u8","type":"application/x-mpegURL"}]}'></div>`,
+  plyr: `<div id="player" data-source='{"sources":[{"src":"//cdn2.vimeus.test/v/abc/index.m3u8","type":"application/x-mpegURL"}]}'></div>`,
 
   videojs: `<script>player.src({ src: "https://cdn3.example.net/stream/tt1234567/playlist.m3u8", type: "application/x-mpegURL" });</script>`,
 
@@ -120,12 +120,12 @@ const FIXTURES = {
 test('extract: JWPlayer con file escapado (\\/)', () => {
   const urls = extractM3u8Urls(FIXTURES.jwplayer, BASE);
   assert.equal(urls.length, 1);
-  assert.equal(urls[0], 'https://cdn.unlimplay.com/hls/tt1234567/master.m3u8?token=abc123');
+  assert.equal(urls[0], 'https://cdn.vimeus.test/hls/tt1234567/master.m3u8?token=abc123');
 });
 
 test('extract: Plyr con URL protocol-relative', () => {
   const urls = extractM3u8Urls(FIXTURES.plyr, BASE);
-  assert.deepEqual(urls, ['https://cdn2.unlimplay.video/v/abc/index.m3u8']);
+  assert.deepEqual(urls, ['https://cdn2.vimeus.test/v/abc/index.m3u8']);
 });
 
 test('extract: Video.js con src entre comillas', () => {
@@ -192,7 +192,7 @@ test('extract: URL Base64 y doble percent-encoding', () => {
 test('extract: source con ruta HLS relativa explícita', () => {
   assert.deepEqual(
     extractM3u8Urls('<video><source src="/hls/master.m3u8?token=x"></video>', BASE),
-    ['https://unlimplay.com/hls/master.m3u8?token=x'],
+    ['https://vimeus.com/hls/master.m3u8?token=x'],
   );
 });
 
@@ -244,9 +244,9 @@ test('findConfigUrls: detecta endpoints de API y descarta estáticos', () => {
     <script>fetch("/api/source/tt1234567").then(...)</script>
     <script>var cfg = "https://api.example.net/player/config.php?id=tt1234567";</script>`;
   const urls = findConfigUrls(html, BASE);
-  assert.ok(urls.includes('https://unlimplay.com/api/source/tt1234567'));
+  assert.ok(urls.includes('https://vimeus.com/api/source/tt1234567'));
   assert.ok(urls.includes('https://api.example.net/player/config.php?id=tt1234567'));
-  assert.ok(urls.includes('https://unlimplay.com/assets/player.js'));
+  assert.ok(urls.includes('https://vimeus.com/assets/player.js'));
   assert.ok(!urls.some((u) => u.endsWith('logo.png')));
 });
 
@@ -284,13 +284,14 @@ test('rewritePlaylist: proxifica variantes, segmentos y claves', () => {
 
   assert.ok(out.startsWith('#EXTM3U'));
   assert.ok(
-    out.includes('URI="https://w.dev/proxy?url=https%3A%2F%2Fcdn.example.net%2Fhls%2Ftt1%2Fkey.php%3Fk%3D1&provider=unlimplay"'),
+    out.includes('URI="https://w.dev/proxy?url=https%3A%2F%2Fcdn.example.net%2Fhls%2Ftt1%2Fkey.php%3Fk%3D1"'),
   );
   assert.ok(out.includes('https://w.dev/proxy?url=https%3A%2F%2Fcdn.example.net%2Fhls%2Ftt1%2Fseg0.ts'));
   assert.ok(out.includes('https://w.dev/proxy?url=https%3A%2F%2Fcdn.example.net%2Fhls%2Ftt1%2Fseg1.ts'));
   assert.ok(out.includes('https://w.dev/proxy?url=https%3A%2F%2Fcdn.example.net%2Fhls%2Ftt1%2Fseg2.ts'));
   assert.ok(out.includes('#EXT-X-ENDLIST'));
   assert.ok(out.includes('#EXTINF:6.0,'));
+  assert.ok(!out.includes('provider='), 'ya no se añade el parámetro provider');
 });
 
 test('rewritePlaylist: master con variantes absolutas', () => {
@@ -305,7 +306,8 @@ test('rewritePlaylist: master con variantes absolutas', () => {
 test('buildManifest: cumple el contrato de Stremio', () => {
   const m = buildManifest();
   assert.equal(m.id, 'com.cf.unlimplay.proxy');
-  assert.equal(m.name, 'Vimeus + UnlimPlay HLS');
+  assert.equal(m.name, 'Vimeus HLS');
+  assert.equal(m.logo, 'https://vimeus.com/favicon.ico');
   assert.deepEqual(m.resources, ['stream']);
   assert.deepEqual(m.types, ['movie', 'series']);
   assert.deepEqual(m.idPrefixes, ['tt', 'tmdb:']);
@@ -313,7 +315,7 @@ test('buildManifest: cumple el contrato de Stremio', () => {
 });
 
 test('extract: el patrón D no inventa URLs con bases que son sólo la raíz', () => {
-  const html = '<script>var h = "https://unlimplay.com/"; var f = "master.m3u8";</script>';
+  const html = '<script>var h = "https://vimeus.com/"; var f = "master.m3u8";</script>';
   assert.deepEqual(extractM3u8Urls(html, BASE), []);
 });
 
@@ -342,14 +344,6 @@ test('truncateSmart: no modifica documentos pequeños', async () => {
 // ---------------------------------------------------------------------------
 // Proveedores
 // ---------------------------------------------------------------------------
-test('resolveProviderOrder: Vimeus es principal y UnlimPlay fallback', () => {
-  assert.deepEqual(resolveProviderOrder({}), ['vimeus', 'unlimplay']);
-  assert.deepEqual(resolveProviderOrder({ PROVIDER_ORDER: 'unlimplay,vimeus,vimeus,other' }), [
-    'unlimplay',
-    'vimeus',
-  ]);
-});
-
 test('resolveVimeusSource: construye embeds IMDb/TMDb con view_key', () => {
   const source = resolveVimeusSource({ VIMEUS_VIEW_KEY: 'test-key' });
   assert.equal(source.origin, 'https://vimeus.com');
@@ -375,29 +369,35 @@ test('resolveVimeusSource: sin clave no crea una URL de embed', () => {
   assert.deepEqual(source.embedUrlsFor('movie', 'tt123'), []);
 });
 
-// ---------------------------------------------------------------------------
-// resolveSource (origen configurable por env)
-// ---------------------------------------------------------------------------
-test('resolveSource: valores por defecto exigidos por el addon', async () => {
-  const { resolveSource } = await import('../src/index.js');
-  const s = resolveSource({});
-  assert.equal(s.origin, 'https://unlimplay.com');
-  assert.equal(s.referer, 'https://unlimplay.com/');
-  assert.equal(s.embedUrl('tt1234567'), 'https://unlimplay.com/f/embed/movie/tt1234567');
-  assert.equal(s.tvEmbedPath, '/f/embed/tv/');
-  assert.equal(s.embedUrlFor('series', 'tt0903747', 1, 2), 'https://unlimplay.com/f/embed/tv/tt0903747/1/2');
+test('resolveVimeusSource: valores por defecto y alias resolveSource', () => {
+  const source = resolveVimeusSource({});
+  assert.equal(source.key, 'vimeus');
+  assert.equal(source.name, 'Vimeus');
+  assert.equal(source.origin, 'https://vimeus.com');
+  assert.equal(source.referer, 'https://vimeus.com/');
+  assert.equal(source.moviePath, '/e/movie');
+  assert.deepEqual(source.seriesPaths, ['/e/serie', '/e/anime']);
+  assert.equal(resolveSource, resolveVimeusSource);
 });
 
-test('resolveSource: sobrescribible por variables de entorno', async () => {
-  const { resolveSource } = await import('../src/index.js');
-  const s = resolveSource({
-    SOURCE_ORIGIN: 'https://mirror.example.org/',
-    EMBED_PATH: 'embed/movie',
-    TV_EMBED_PATH: 'embed/tv',
+test('resolveVimeusSource: sobrescribible por variables de entorno', () => {
+  const source = resolveVimeusSource({
+    VIMEUS_ORIGIN: 'https://mirror.example.org/',
+    VIMEUS_REFERER: 'https://allowed.example/',
+    VIMEUS_MOVIE_PATH: 'embed/film',
+    VIMEUS_SERIES_PATHS: '/embed/show, /embed/anime',
+    VIEW_KEY: 'legacy',
   });
-  assert.equal(s.origin, 'https://mirror.example.org');
-  assert.equal(s.referer, 'https://mirror.example.org/');
-  assert.equal(s.embedUrl('tt1'), 'https://mirror.example.org/embed/movie/tt1');
-  assert.equal(s.embedUrl('a b'), 'https://mirror.example.org/embed/movie/a%20b');
-  assert.equal(s.embedUrlFor('series', 'tt1', 2, 4), 'https://mirror.example.org/embed/tv/tt1/2/4');
+  assert.equal(source.origin, 'https://mirror.example.org');
+  assert.equal(source.referer, 'https://allowed.example/');
+  assert.equal(source.viewKey, 'legacy');
+
+  const movie = new URL(source.embedUrlsFor('movie', 'a b')[0]);
+  assert.equal(movie.origin, 'https://mirror.example.org');
+  assert.equal(movie.pathname, '/embed/film');
+  assert.equal(movie.searchParams.get('tmdb'), 'a b');
+
+  const series = source.embedUrlsFor('series', 'tt1', 2, 4).map((value) => new URL(value));
+  assert.deepEqual(series.map((url) => url.pathname), ['/embed/show', '/embed/anime']);
+  assert.throws(() => source.embedUrlsFor('series', 'tt1', 1, 0), /temporada y episodio/);
 });

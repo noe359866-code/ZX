@@ -3,23 +3,21 @@
  *  tools/mock-origin.mjs — Origen de vídeo de pega para pruebas locales
  * ============================================================================
  *
- *  Simula los embeds de Vimeus y UnlimPlay + su CDN para probar el Worker de
- *  punta a punta sin tocar la red real. NO se despliega: sólo desarrollo.
+ *  Simula el embed de Vimeus + su CDN para probar el Worker de punta a punta
+ *  sin tocar la red real. NO se despliega: sólo desarrollo.
  *
  *  Uso:
  *    node tools/mock-origin.mjs            # escucha en 0.0.0.0:8788
  *    PORT=9000 node tools/mock-origin.mjs
  *
- *  Rutas:
- *    GET /e/movie?imdb=tt1234567&view_key=local-test-key → mock Vimeus, HLS directo
- *    GET /e/serie|/e/anime?...                        → mock Vimeus para episodios
- *    GET /f/embed/movie/tt1234567                     → fallback UnlimPlay
- *    GET /f/embed/movie/tt9999999   → HTML con deep-scan: el .m3u8 viene de /api
- *    GET /api/source/tt9999999      → JSON con la URL del stream
- *    GET /f/embed/movie/tt0000000   → HTML sin ningún .m3u8
- *    GET /f/embed/tv/{id}/{s}/{e}   → HTML con JWPlayer para probar series
- *    GET /hls/.../*.m3u8            → playlists (exigen Referer, si no → 403)
- *    GET /hls/.../*.ts              → segmentos de pega (exigen Referer)
+ *  Rutas (todas exigen view_key=local-test-key):
+ *    GET /e/movie?imdb=tt1234567&view_key=… → JWPlayer con el .m3u8 escapado
+ *    GET /e/movie?imdb=tt9999999&view_key=… → deep-scan: el .m3u8 viene de /api
+ *    GET /e/movie?imdb=tt0000000&view_key=… → HTML sin ningún .m3u8
+ *    GET /e/serie|/e/anime?tmdb=…&se=&ep=   → episodios (mismo fixture JWPlayer)
+ *    GET /api/source/tt9999999              → JSON con la URL del stream
+ *    GET /hls/.../*.m3u8                    → playlists (exigen Referer, si no → 403)
+ *    GET /hls/.../*.ts                      → segmentos de pega (exigen Referer)
  * ============================================================================
  */
 import { createServer } from 'node:http';
@@ -54,7 +52,7 @@ function send(res, status, body, type = 'text/html; charset=utf-8') {
 
 /** Escenario 1 — JWPlayer con la URL escapada como JSON ("https:\/\/…"). */
 const embedJwplayer = (req) => `<!doctype html>
-<html><head><title>UnlimPlay — embed</title></head><body>
+<html><head><title>Vimeus — embed</title></head><body>
 <div id="player"></div>
 <script src="/assets/jwplayer.js"></script>
 <script>
@@ -131,15 +129,10 @@ const server = createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const path = url.pathname;
 
-  // --- Embeds -------------------------------------------------------------
+  // --- Embed Vimeus -------------------------------------------------------
   if (path === '/e/movie' || path === '/e/serie' || path === '/e/anime') {
     return embedVimeus(req, res);
   }
-  if (path === '/f/embed/movie/tt1234567') return send(res, 200, embedJwplayer(req));
-  if (path === '/f/embed/movie/tt9999999') return send(res, 200, embedDeepScan(req));
-  if (path === '/f/embed/movie/tt0000000') return send(res, 200, embedEmpty());
-  if (path.startsWith('/f/embed/tv/')) return send(res, 200, embedJwplayer(req));
-  if (path.startsWith('/f/embed/movie/')) return send(res, 200, embedJwplayer(req));
 
   // --- API usada por el deep-scan ------------------------------------------
   if (path === '/api/source/tt9999999') {
@@ -196,8 +189,7 @@ const server = createServer((req, res) => {
 
 server.listen(PORT, HOST, () => {
   console.log(`[mock-origin] escuchando en http://${HOST}:${PORT}`);
-  console.log(`[mock-origin] Vimeus mock  → http://${HOST}:${PORT}/e/movie?imdb=tt1234567&view_key=${VIMEUS_MOCK_VIEW_KEY}`);
-  console.log(`[mock-origin] embed fallback → http://${HOST}:${PORT}/f/embed/movie/tt1234567`);
-  console.log(`[mock-origin] embed deep    → http://${HOST}:${PORT}/f/embed/movie/tt9999999`);
-  console.log(`[mock-origin] embed vacío   → http://${HOST}:${PORT}/f/embed/movie/tt0000000`);
+  console.log(`[mock-origin] embed HLS   → http://${HOST}:${PORT}/e/movie?imdb=tt1234567&view_key=${VIMEUS_MOCK_VIEW_KEY}`);
+  console.log(`[mock-origin] embed deep  → http://${HOST}:${PORT}/e/movie?imdb=tt9999999&view_key=${VIMEUS_MOCK_VIEW_KEY}`);
+  console.log(`[mock-origin] embed vacío → http://${HOST}:${PORT}/e/movie?imdb=tt0000000&view_key=${VIMEUS_MOCK_VIEW_KEY}`);
 });

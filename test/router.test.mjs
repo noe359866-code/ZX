@@ -9,16 +9,23 @@ import assert from 'node:assert/strict';
 
 import workerImplementation from '../src/index.js';
 
+const VIEW_KEY = 'test-view-key';
+
 // La mayoría de los tests prueban el extractor sin una segunda petición HLS;
-// los casos de verify explícito activan VERIFY_HLS=1 en su env.
+// los casos de verify explícito activan VERIFY_HLS=1 en su env. La view_key de
+// prueba se inyecta por defecto; los tests que la omiten lo hacen explícito.
 const worker = {
   fetch(request, env = {}, ctx = {}) {
-    return workerImplementation.fetch(request, { VERIFY_HLS: '0', ...env }, ctx);
+    return workerImplementation.fetch(
+      request,
+      { VERIFY_HLS: '0', VIMEUS_VIEW_KEY: VIEW_KEY, ...env },
+      ctx,
+    );
   },
 };
 
 const WORKER_URL = 'https://unlimplay-proxy.user.workers.dev';
-const EMBED_URL = 'https://unlimplay.com/f/embed/movie/tt1234567';
+const EMBED_URL = `https://vimeus.com/e/movie?imdb=tt1234567&view_key=${VIEW_KEY}`;
 
 const realFetch = globalThis.fetch;
 
@@ -38,6 +45,12 @@ function mockFetch(handler) {
 
 const htmlResponse = (body) =>
   new Response(body, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+
+const playlistResponse = () =>
+  new Response('#EXTM3U\n#EXTINF:4,\nsegment.ts\n', {
+    status: 200,
+    headers: { 'Content-Type': 'application/vnd.apple.mpegurl' },
+  });
 
 beforeEach(() => {
   globalThis.fetch = realFetch;
@@ -86,7 +99,10 @@ test('raíz: healthcheck con la URL de instalación', async () => {
   assert.equal(res.status, 200);
   const body = await res.json();
   assert.equal(body.status, 'ok');
+  assert.equal(body.provider, 'vimeus');
+  assert.equal(body.vimeusConfigured, true);
   assert.equal(body.install, `${WORKER_URL}/manifest.json`);
+  assert.ok(!JSON.stringify(body).includes(VIEW_KEY), 'el healthcheck no expone la view_key');
 });
 
 // ---------------------------------------------------------------------------
@@ -99,7 +115,8 @@ test('GET /manifest.json: contrato exacto de Stremio', async () => {
 
   const m = await res.json();
   assert.equal(m.id, 'com.cf.unlimplay.proxy');
-  assert.equal(m.name, 'Vimeus + UnlimPlay HLS');
+  assert.equal(m.name, 'Vimeus HLS');
+  assert.equal(m.logo, 'https://vimeus.com/favicon.ico');
   assert.deepEqual(m.resources, ['stream']);
   assert.deepEqual(m.types, ['movie', 'series']);
   assert.deepEqual(m.idPrefixes, ['tt', 'tmdb:']);
@@ -111,40 +128,91 @@ test('GET /manifest.json: contrato exacto de Stremio', async () => {
 const EMBED_HTML = `<!doctype html><html><body><script>
   jwplayer("player").setup({
     sources: [{
-      file: "https:\\/\\/cdn.unlimplay.com\\/hls\\/tt1234567\\/master.m3u8?token=abc123",
+      file: "https:\\/\\/cdn.vimeus.test\\/hls\\/tt1234567\\/master.m3u8?token=abc123",
       type: "application/x-mpegURL"
     }]
   });
 </script></body></html>`;
 
-test('Vimeus es principal: extrae HLS y devuelve cabeceras del proveedor a Stremio', async () => {
+test('GET /stream/movie/{id}.json: pide el embed de Vimeus y responde a Stremio', async () => {
   const calls = mockFetch((url) => {
     const parsed = new URL(url);
     assert.equal(parsed.origin, 'https://vimeus.com');
     assert.equal(parsed.pathname, '/e/movie');
     assert.equal(parsed.searchParams.get('imdb'), 'tt1234567');
-    assert.equal(parsed.searchParams.get('view_key'), 'test-view-key');
-    return htmlResponse('<script>player.setup({file:"https://cdn.vimeus.test/master.m3u8?token=short"})</script>');
+    assert.equal(parsed.searchParams.get('view_key'), VIEW_KEY);
+    return htmlResponse(EMBED_HTML);
   });
+
+  const res = await call('/stream/movie/tt1234567.json');
+  assert.equal(res.status, 200);
+
+  const body = await res.json();
+  assert.equal(body.streams.length, 1);
+
+  const stream = body.streams[0];
+  assert.equal(stream.name, 'Vimeus HLS');
+  assert.equal(stream.title, 'Vimeus [HLS]');
+  assert.equal(stream.type, 'hls');
+  assert.equal(stream.url, 'https://cdn.vimeus.test/hls/tt1234567/master.m3u8?token=abc123');
+
+  assert.equal(stream.behaviorHints.notSupported, false);
+  assert.equal(stream.behaviorHints.requestHeaders.Referer, 'https://vimeus.com/');
+  assert.match(stream.behaviorHints.requestHeaders['User-Agent'], /^Mozilla\/5\.0 \(Windows NT 10\.0; Win64; x64\)/);
+  assert.equal(stream.behaviorHints.proxyHeaders.request.Origin, 'https://vimeus.com');
+  assert.equal(stream.behaviorHints.bingeGroup, 'vimeus-0');
+
+  assert.equal(res.headers.get('X-Stream-Provider'), 'vimeus');
+  assert.equal(res.headers.get('X-Candidates-Found'), '1');
+
+  // Cabeceras de navegador moderno en la petición de scraping.
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].init.headers['User-Agent'], /Chrome\/\d+.*Safari\/537\.36/);
+  assert.equal(calls[0].init.headers.Referer, 'https://vimeus.com/');
+  assert.ok(!JSON.stringify(body).includes(VIEW_KEY), 'view_key no se filtra al cliente');
+});
+
+test('VIMEUS_REFERER se propaga a Stremio y al scraping', async () => {
+  const calls = mockFetch(() =>
+    htmlResponse('<script>player.setup({file:"https://cdn.vimeus.test/master.m3u8?token=short"})</script>'),
+  );
 
   const res = await worker.fetch(
     new Request(`${WORKER_URL}/stream/movie/tt1234567.json`),
-    {
-      VIMEUS_VIEW_KEY: 'test-view-key',
-      VIMEUS_REFERER: 'https://allowed.example/',
-    },
+    { VIMEUS_REFERER: 'https://allowed.example/' },
     {},
   );
   const body = await res.json();
 
   assert.equal(body.streams.length, 1);
-  assert.equal(body.streams[0].title, 'Vimeus [HLS]');
   assert.equal(body.streams[0].url, 'https://cdn.vimeus.test/master.m3u8?token=short');
   assert.equal(body.streams[0].behaviorHints.requestHeaders.Referer, 'https://allowed.example/');
-  assert.equal(res.headers.get('X-Stream-Provider'), 'vimeus');
-  assert.equal(res.headers.get('X-Provider-Attempts'), 'vimeus:hls');
-  assert.equal(calls.length, 1, 'si Vimeus encuentra HLS no se consulta UnlimPlay');
-  assert.ok(!JSON.stringify(body).includes('test-view-key'), 'view_key no se filtra al cliente');
+  assert.equal(calls[0].init.headers.Referer, 'https://allowed.example/');
+});
+
+test('sin VIMEUS_VIEW_KEY: no consulta el origen y devuelve streams vacío', async () => {
+  const calls = mockFetch(() => htmlResponse(EMBED_HTML));
+  const res = await worker.fetch(
+    new Request(`${WORKER_URL}/stream/movie/tt1234567.json`),
+    { VIMEUS_VIEW_KEY: '' },
+    {},
+  );
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), { streams: [] });
+  assert.equal(res.headers.get('X-Proxy-Error'), 'missing-view-key');
+  assert.equal(res.headers.get('X-Stream-Provider'), null);
+  assert.equal(calls.length, 0);
+});
+
+test('VIEW_KEY (alias heredado) también configura la clave', async () => {
+  const calls = mockFetch(() => htmlResponse(EMBED_HTML));
+  const res = await worker.fetch(
+    new Request(`${WORKER_URL}/stream/movie/tt1234567.json`),
+    { VIMEUS_VIEW_KEY: '', VIEW_KEY: 'legacy-key' },
+    {},
+  );
+  assert.equal((await res.json()).streams.length, 1);
+  assert.equal(new URL(calls[0].url).searchParams.get('view_key'), 'legacy-key');
 });
 
 test('VERIFY_HLS acepta un HLS válido y usa las cabeceras del proveedor', async () => {
@@ -154,22 +222,14 @@ test('VERIFY_HLS acepta un HLS válido y usa las cabeceras del proveedor', async
     }
     if (url === 'https://cdn.vimeus.test/live.m3u8?token=fresh') {
       assert.equal(init.headers.Referer, 'https://allowed.example/');
-      return new Response('#EXTM3U\n#EXTINF:4,\nsegment.ts\n', {
-        status: 200,
-        headers: { 'Content-Type': 'application/vnd.apple.mpegurl' },
-      });
+      return playlistResponse();
     }
     throw new Error(`petición inesperada: ${url}`);
   });
 
   const res = await worker.fetch(
     new Request(`${WORKER_URL}/stream/movie/tt1234567.json`),
-    {
-      VERIFY_HLS: '1',
-      VIMEUS_VIEW_KEY: 'test-view-key',
-      VIMEUS_REFERER: 'https://allowed.example/',
-      PROVIDER_ORDER: 'vimeus',
-    },
+    { VERIFY_HLS: '1', VIMEUS_REFERER: 'https://allowed.example/' },
     {},
   );
   const body = await res.json();
@@ -178,7 +238,7 @@ test('VERIFY_HLS acepta un HLS válido y usa las cabeceras del proveedor', async
   assert.equal(calls.length, 2, 'una petición al embed y otra a la playlist');
 });
 
-test('VERIFY_HLS activa UnlimPlay si la playlist HLS de Vimeus devuelve 403', async () => {
+test('VERIFY_HLS: si la playlist devuelve 403 no hay streams y se diagnostica', async () => {
   const calls = mockFetch((url) => {
     if (url.startsWith('https://vimeus.com/e/movie?')) {
       return htmlResponse('<script>player.setup({file:"https://cdn.vimeus.test/expired.m3u8?token=old"})</script>');
@@ -186,26 +246,18 @@ test('VERIFY_HLS activa UnlimPlay si la playlist HLS de Vimeus devuelve 403', as
     if (url === 'https://cdn.vimeus.test/expired.m3u8?token=old') {
       return new Response('token expired', { status: 403 });
     }
-    if (url === EMBED_URL) return htmlResponse(EMBED_HTML);
-    if (url === 'https://cdn.unlimplay.com/hls/tt1234567/master.m3u8?token=abc123') {
-      return new Response('#EXTM3U\n#EXTINF:4,\nsegment.ts\n', {
-        status: 200,
-        headers: { 'Content-Type': 'application/vnd.apple.mpegurl' },
-      });
-    }
     throw new Error(`petición inesperada: ${url}`);
   });
 
   const res = await worker.fetch(
     new Request(`${WORKER_URL}/stream/movie/tt1234567.json`),
-    { VERIFY_HLS: '1', VIMEUS_VIEW_KEY: 'test-view-key' },
+    { VERIFY_HLS: '1' },
     {},
   );
-  const body = await res.json();
-  assert.equal(res.headers.get('X-Stream-Provider'), 'unlimplay');
-  assert.equal(res.headers.get('X-Provider-Attempts'), 'vimeus:http-403,unlimplay:hls');
-  assert.equal(body.streams[0].url, 'https://cdn.unlimplay.com/hls/tt1234567/master.m3u8?token=abc123');
-  assert.equal(calls.length, 4);
+  assert.deepEqual(await res.json(), { streams: [] });
+  assert.equal(res.headers.get('X-Proxy-Error'), 'upstream');
+  assert.match(res.headers.get('X-Proxy-Detail'), /403/);
+  assert.equal(calls.length, 2, 'no existe ningún proveedor de respaldo que consultar');
 });
 
 test('VERIFY_HLS descarta páginas HTML servidas con HTTP 200', async () => {
@@ -219,22 +271,21 @@ test('VERIFY_HLS descarta páginas HTML servidas con HTTP 200', async () => {
 
   const res = await worker.fetch(
     new Request(`${WORKER_URL}/stream/movie/tt1234567.json`),
-    { VERIFY_HLS: '1', VIMEUS_VIEW_KEY: 'test-view-key', PROVIDER_ORDER: 'vimeus' },
+    { VERIFY_HLS: '1' },
     {},
   );
   assert.deepEqual(await res.json(), { streams: [] });
   assert.equal(res.headers.get('X-Proxy-Error'), 'upstream');
-  assert.equal(res.headers.get('X-Provider-Attempts'), 'vimeus:invalid-hls');
   assert.equal(calls.length, 2);
 });
 
-test('Vimeus: si /e/serie no encuentra HLS, intenta /e/anime para un episodio', async () => {
+test('series: si /e/serie no encuentra HLS, intenta /e/anime para un episodio', async () => {
   const calls = mockFetch((url) => {
     const parsed = new URL(url);
     assert.equal(parsed.searchParams.get('tmdb'), '1429');
     assert.equal(parsed.searchParams.get('se'), '2');
     assert.equal(parsed.searchParams.get('ep'), '3');
-    assert.equal(parsed.searchParams.get('view_key'), 'test-view-key');
+    assert.equal(parsed.searchParams.get('view_key'), VIEW_KEY);
     if (parsed.pathname === '/e/serie') return htmlResponse('<html>sin fuente</html>');
     if (parsed.pathname === '/e/anime') {
       return htmlResponse('<script>player.setup({file:"https://cdn.vimeus.test/episode.m3u8"})</script>');
@@ -242,17 +293,13 @@ test('Vimeus: si /e/serie no encuentra HLS, intenta /e/anime para un episodio', 
     throw new Error(`endpoint Vimeus inesperado: ${url}`);
   });
 
-  const res = await worker.fetch(
-    new Request(`${WORKER_URL}/stream/series/tmdb%3A1429%3A2%3A3.json`),
-    { VIMEUS_VIEW_KEY: 'test-view-key', PROVIDER_ORDER: 'vimeus' },
-    {},
-  );
+  const res = await call('/stream/series/tmdb%3A1429%3A2%3A3.json');
   const body = await res.json();
 
   assert.equal(body.streams.length, 1);
   assert.equal(body.streams[0].url, 'https://cdn.vimeus.test/episode.m3u8');
   assert.equal(res.headers.get('X-Stream-Provider'), 'vimeus');
-  assert.deepEqual(calls.map((call) => new URL(call.url).pathname), ['/e/serie', '/e/anime']);
+  assert.deepEqual(calls.map((c) => new URL(c.url).pathname), ['/e/serie', '/e/anime']);
 });
 
 test('VERIFY_HLS prueba /e/anime si el HLS de /e/serie está vencido', async () => {
@@ -267,78 +314,54 @@ test('VERIFY_HLS prueba /e/anime si el HLS de /e/serie está vencido', async () 
     if (parsed.pathname === '/e/anime') {
       return htmlResponse('<script>player.setup({file:"https://cdn.vimeus.test/valid.m3u8"})</script>');
     }
-    if (url === 'https://cdn.vimeus.test/valid.m3u8') {
-      return new Response('#EXTM3U\n#EXTINF:4,\nsegment.ts\n', {
-        status: 200,
-        headers: { 'Content-Type': 'application/vnd.apple.mpegurl' },
-      });
-    }
+    if (url === 'https://cdn.vimeus.test/valid.m3u8') return playlistResponse();
     throw new Error(`petición inesperada: ${url}`);
   });
 
   const res = await worker.fetch(
     new Request(`${WORKER_URL}/stream/series/tmdb%3A1429%3A2%3A3.json`),
-    { VERIFY_HLS: '1', VIMEUS_VIEW_KEY: 'test-view-key', PROVIDER_ORDER: 'vimeus' },
+    { VERIFY_HLS: '1' },
     {},
   );
   const body = await res.json();
-  assert.equal(res.headers.get('X-Stream-Provider'), 'vimeus');
   assert.equal(body.streams[0].url, 'https://cdn.vimeus.test/valid.m3u8');
-  assert.deepEqual(calls.map((call) => new URL(call.url).pathname), [
+  assert.deepEqual(calls.map((c) => new URL(c.url).pathname), [
     '/e/serie', '/expired.m3u8', '/e/anime', '/valid.m3u8',
   ]);
 });
 
-test('UnlimPlay es fallback cuando Vimeus no devuelve HLS', async () => {
+test('series: traduce id:temporada:episodio con IMDb a /e/serie', async () => {
   const calls = mockFetch((url) => {
-    if (url.startsWith('https://vimeus.com/e/movie?')) return htmlResponse('<html>sin fuente</html>');
-    if (url === EMBED_URL) return htmlResponse(EMBED_HTML);
-    throw new Error(`petición inesperada: ${url}`);
+    const parsed = new URL(url);
+    assert.equal(parsed.pathname, '/e/serie');
+    assert.equal(parsed.searchParams.get('imdb'), 'tt0903747');
+    assert.equal(parsed.searchParams.get('se'), '1');
+    assert.equal(parsed.searchParams.get('ep'), '2');
+    return htmlResponse('<script>player.setup({file:"https://cdn.example.net/episode.m3u8"})</script>');
   });
 
-  const res = await worker.fetch(
-    new Request(`${WORKER_URL}/stream/movie/tt1234567.json`),
-    { VIMEUS_VIEW_KEY: 'test-view-key' },
-    {},
-  );
-  const body = await res.json();
-
-  assert.equal(body.streams.length, 1);
-  assert.equal(body.streams[0].title, 'UnlimPlay [respaldo] [HLS]');
-  assert.equal(res.headers.get('X-Stream-Provider'), 'unlimplay');
-  assert.equal(res.headers.get('X-Provider-Attempts'), 'vimeus:no-hls,unlimplay:hls');
-  assert.deepEqual(calls.map((call) => call.url), [
-    'https://vimeus.com/e/movie?imdb=tt1234567&view_key=test-view-key',
-    EMBED_URL,
-  ]);
-});
-
-test('UnlimPlay también se prueba si Vimeus devuelve 403', async () => {
-  const calls = mockFetch((url) => {
-    if (url.startsWith('https://vimeus.com/e/movie?')) return new Response('no autorizado', { status: 403 });
-    if (url === EMBED_URL) return htmlResponse(EMBED_HTML);
-    throw new Error(`petición inesperada: ${url}`);
-  });
-
-  const res = await worker.fetch(
-    new Request(`${WORKER_URL}/stream/movie/tt1234567.json`),
-    { VIMEUS_VIEW_KEY: 'test-view-key' },
-    {},
-  );
-  const body = await res.json();
-
-  assert.equal(body.streams.length, 1);
-  assert.equal(res.headers.get('X-Stream-Provider'), 'unlimplay');
-  assert.equal(res.headers.get('X-Provider-Attempts'), 'vimeus:http-403,unlimplay:hls');
-  assert.equal(calls.length, 2);
-});
-
-test('sin VIMEUS_VIEW_KEY se omite Vimeus y se usa UnlimPlay', async () => {
-  const calls = mockFetch(() => htmlResponse(EMBED_HTML));
-  const res = await call('/stream/movie/tt1234567.json');
-  assert.equal(res.headers.get('X-Stream-Provider'), 'unlimplay');
-  assert.equal(res.headers.get('X-Provider-Attempts'), 'vimeus:missing-view-key,unlimplay:hls');
+  const res = await call('/stream/series/tt0903747:1:2.json');
+  const { streams } = await res.json();
+  assert.equal(streams.length, 1);
   assert.equal(calls.length, 1);
+});
+
+test('series: también acepta tmdb id en segmentos y rechaza episodio incompleto', async () => {
+  const calls = mockFetch(() =>
+    htmlResponse('<script>player.setup({file:"https://cdn.example.net/episode.m3u8"})</script>'),
+  );
+  const res = await call('/stream/tv/1396/1/1.json');
+  assert.equal((await res.json()).streams.length, 1);
+  const first = new URL(calls[0].url);
+  assert.equal(first.pathname, '/e/serie');
+  assert.equal(first.searchParams.get('tmdb'), '1396');
+  assert.equal(first.searchParams.get('se'), '1');
+  assert.equal(first.searchParams.get('ep'), '1');
+
+  const invalid = await call('/stream/series/tt0903747.json');
+  assert.deepEqual(await invalid.json(), { streams: [] });
+  assert.equal(invalid.headers.get('X-Proxy-Error'), 'bad-id');
+  assert.equal(calls.length, 1, 'no consulta el origen para un episodio incompleto');
 });
 
 test('los diagnósticos no filtran el view_key de un error Vimeus', async () => {
@@ -346,7 +369,7 @@ test('los diagnósticos no filtran el view_key de un error Vimeus', async () => 
   mockFetch(() => new Response('no autorizado', { status: 403 }));
   const res = await worker.fetch(
     new Request(`${WORKER_URL}/stream/movie/tt1234567.json`),
-    { VIMEUS_VIEW_KEY: secret, PROVIDER_ORDER: 'vimeus' },
+    { VIMEUS_VIEW_KEY: secret },
     {},
   );
   const detail = res.headers.get('X-Proxy-Detail') || '';
@@ -355,38 +378,13 @@ test('los diagnósticos no filtran el view_key de un error Vimeus', async () => 
   assert.ok(!detail.includes(secret));
 });
 
-test('GET /stream/movie/{id}.json: URL pedida al embed y respuesta Stremio', async () => {
-  const calls = mockFetch((url) => {
-    assert.equal(url, EMBED_URL, 'debe consultar https://unlimplay.com/f/embed/movie/{id}');
-    return htmlResponse(EMBED_HTML);
-  });
-
-  const res = await call('/stream/movie/tt1234567.json');
-  assert.equal(res.status, 200);
-
-  const body = await res.json();
-  assert.equal(body.streams.length, 1);
-
-  const stream = body.streams[0];
-  assert.equal(stream.title, 'UnlimPlay [respaldo] [HLS]');
-  assert.equal(stream.type, 'hls');
-  assert.equal(stream.url, 'https://cdn.unlimplay.com/hls/tt1234567/master.m3u8?token=abc123');
-
-  assert.equal(stream.behaviorHints.notSupported, false);
-  assert.equal(stream.behaviorHints.requestHeaders.Referer, 'https://unlimplay.com/');
-  assert.match(stream.behaviorHints.requestHeaders['User-Agent'], /^Mozilla\/5\.0 \(Windows NT 10\.0; Win64; x64\)/);
-
-  // Cabeceras de navegador moderno en la petición de scraping.
-  assert.equal(calls.length, 1);
-  assert.match(calls[0].init.headers['User-Agent'], /Chrome\/\d+.*Safari\/537\.36/);
-  assert.equal(calls[0].init.headers.Referer, 'https://unlimplay.com/');
-});
-
-test('el id se limpia: tmdb:movie:550.json → 550', async () => {
+test('el id se limpia: tmdb:movie:550.json → tmdb=550', async () => {
   const calls = mockFetch(() => htmlResponse(EMBED_HTML));
   const res = await call('/stream/movie/tmdb:movie:550.json');
   assert.equal(res.status, 200);
-  assert.equal(calls[0].url, 'https://unlimplay.com/f/embed/movie/550');
+  const parsed = new URL(calls[0].url);
+  assert.equal(parsed.searchParams.get('tmdb'), '550');
+  assert.equal(parsed.searchParams.get('imdb'), null);
   const body = await res.json();
   assert.equal(body.streams.length, 1);
 });
@@ -399,11 +397,12 @@ test('id inválido: devuelve streams vacío sin llamar al origen', async () => {
   assert.equal(calls.length, 0);
 });
 
-test('HTML sin .m3u8: devuelve {"streams": []}', async () => {
+test('HTML sin .m3u8: devuelve {"streams": []} con not-found', async () => {
   mockFetch(() => htmlResponse('<html><body><p>sin vídeo</p></body></html>'));
   const res = await call('/stream/movie/tt1234567.json');
   assert.equal(res.status, 200);
   assert.deepEqual(await res.json(), { streams: [] });
+  assert.equal(res.headers.get('X-Proxy-Error'), 'not-found');
 });
 
 test('origen caído (HTTP 500): devuelve {"streams": []} sin lanzar', async () => {
@@ -429,8 +428,8 @@ test('deep scan: encuentra el .m3u8 en la API de configuración', async () => {
     if (url === EMBED_URL) {
       return htmlResponse('<script>fetch("/api/source/tt1234567").then(r=>r.json())</script>');
     }
-    if (url === 'https://unlimplay.com/api/source/tt1234567') {
-      return new Response(JSON.stringify({ file: 'https://cdn.unlimplay.com/x/master.m3u8?t=1' }), {
+    if (url === 'https://vimeus.com/api/source/tt1234567') {
+      return new Response(JSON.stringify({ file: 'https://cdn.vimeus.test/x/master.m3u8?t=1' }), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
       });
@@ -441,17 +440,17 @@ test('deep scan: encuentra el .m3u8 en la API de configuración', async () => {
   const res = await call('/stream/movie/tt1234567.json');
   const body = await res.json();
   assert.equal(body.streams.length, 1);
-  assert.equal(body.streams[0].url, 'https://cdn.unlimplay.com/x/master.m3u8?t=1');
+  assert.equal(body.streams[0].url, 'https://cdn.vimeus.test/x/master.m3u8?t=1');
   assert.equal(calls.length, 2, 'una petición al embed + una al endpoint de configuración');
 });
 
 test('deep scan sigue iframes anidados hasta la configuración HLS', async () => {
   const calls = mockFetch((url) => {
     if (url === EMBED_URL) return htmlResponse('<iframe src="/embed/player/tt1234567"></iframe>');
-    if (url === 'https://unlimplay.com/embed/player/tt1234567') {
+    if (url === 'https://vimeus.com/embed/player/tt1234567') {
       return htmlResponse('<iframe src="/player/config.php?id=tt1234567"></iframe>');
     }
-    if (url === 'https://unlimplay.com/player/config.php?id=tt1234567') {
+    if (url === 'https://vimeus.com/player/config.php?id=tt1234567') {
       return new Response(JSON.stringify({ file: 'https://cdn.example.net/hls/master.m3u8?token=live' }), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
@@ -502,30 +501,6 @@ test('redirect directo a un playlist: devuelve la URL final aunque el body sea M
   assert.equal(streams[0].url, playlistUrl);
 });
 
-test('series: traduce id:temporada:episodio al endpoint /f/embed/tv', async () => {
-  const calls = mockFetch((url) => {
-    assert.equal(url, 'https://unlimplay.com/f/embed/tv/tt0903747/1/2');
-    return htmlResponse('<script>player.setup({file:"https://cdn.example.net/episode.m3u8"})</script>');
-  });
-
-  const res = await call('/stream/series/tt0903747:1:2.json');
-  const { streams } = await res.json();
-  assert.equal(streams.length, 1);
-  assert.equal(calls.length, 1);
-});
-
-test('series: también acepta tmdb id en segmentos y rechaza episodio incompleto', async () => {
-  const calls = mockFetch(() => htmlResponse('<script>player.setup({file:"https://cdn.example.net/episode.m3u8"})</script>'));
-  const res = await call('/stream/tv/1396/1/1.json');
-  assert.equal((await res.json()).streams.length, 1);
-  assert.equal(calls[0].url, 'https://unlimplay.com/f/embed/tv/1396/1/1');
-
-  const invalid = await call('/stream/series/tt0903747.json');
-  assert.deepEqual(await invalid.json(), { streams: [] });
-  assert.equal(invalid.headers.get('X-Proxy-Error'), 'bad-id');
-  assert.equal(calls.length, 1, 'no consulta el origen para un episodio incompleto');
-});
-
 test('deep scan no vuelve a solicitar la URL del propio Worker', async () => {
   const calls = mockFetch((url) => {
     if (url !== EMBED_URL) throw new Error(`bucle inesperado: ${url}`);
@@ -573,8 +548,8 @@ test('varios candidatos: el principal conserva el título exigido', async () => 
   const res = await call('/stream/movie/tt1234567.json');
   const { streams } = await res.json();
   assert.ok(streams.length >= 2);
-  assert.equal(streams[0].title, 'UnlimPlay [respaldo] [HLS]');
-  assert.match(streams[1].title, /Alt 2/);
+  assert.equal(streams[0].title, 'Vimeus [HLS]');
+  assert.match(streams[1].title, /^Vimeus \[HLS · Alt 2\]$/);
 });
 
 test('MAX_STREAMS limita el número de streams devueltos', async () => {
@@ -604,37 +579,15 @@ test('PROXY_HLS=1: la URL apunta a la pasarela del Worker', async () => {
   const { streams } = await res.json();
   assert.equal(
     streams[0].url,
-    `${WORKER_URL}/proxy?url=${encodeURIComponent('https://cdn.example.net/master.m3u8')}&provider=unlimplay`,
+    `${WORKER_URL}/proxy?url=${encodeURIComponent('https://cdn.example.net/master.m3u8')}`,
   );
   assert.equal(streams[0].behaviorHints.notWebReady, false);
-});
-
-test('el proxy HLS conserva el proveedor Vimeus en manifiesto y segmentos', async () => {
-  const playlist = ['#EXTM3U', '#EXTINF:4.0,', 'seg0.ts', '#EXT-X-ENDLIST'].join('\n');
-  const calls = mockFetch((url, init) => {
-    assert.equal(url, 'https://cdn.vimeus.test/master.m3u8');
-    assert.equal(init.headers.Referer, 'https://allowed.example/');
-    return new Response(playlist, {
-      status: 200,
-      headers: { 'Content-Type': 'application/vnd.apple.mpegurl' },
-    });
-  });
-
-  const res = await worker.fetch(
-    new Request(`${WORKER_URL}/proxy?url=${encodeURIComponent('https://cdn.vimeus.test/master.m3u8')}&provider=vimeus`),
-    { VIMEUS_REFERER: 'https://allowed.example/' },
-    {},
-  );
-  const body = await res.text();
-  assert.equal(res.status, 200);
-  assert.ok(body.includes('&provider=vimeus'));
-  assert.equal(calls.length, 1);
 });
 
 // ---------------------------------------------------------------------------
 // /proxy — pasarela HLS
 // ---------------------------------------------------------------------------
-test('/proxy: reescribe un playlist hacia el propio Worker', async () => {
+test('/proxy: reescribe un playlist hacia el propio Worker con cabeceras Vimeus', async () => {
   const playlist = ['#EXTM3U', '#EXT-X-VERSION:3', '#EXTINF:4.0,', 'seg0.ts', '#EXT-X-ENDLIST'].join('\n');
   const calls = mockFetch(() =>
     new Response(playlist, {
@@ -651,10 +604,34 @@ test('/proxy: reescribe un playlist hacia el propio Worker', async () => {
   const body = await res.text();
   assert.ok(body.includes('#EXTM3U'));
   assert.ok(body.includes(`${WORKER_URL}/proxy?url=https%3A%2F%2Fcdn.example.net%2Fhls%2Ftt1%2Fseg0.ts`));
+  assert.ok(!body.includes('provider='), 'ya no se propaga el parámetro provider');
 
-  // El proxy inyecta Referer/UA al pedir al CDN.
-  assert.equal(calls[0].init.headers.Referer, 'https://unlimplay.com/');
+  // El proxy inyecta Referer/UA de Vimeus al pedir al CDN.
+  assert.equal(calls[0].init.headers.Referer, 'https://vimeus.com/');
+  assert.equal(calls[0].init.headers.Origin, 'https://vimeus.com');
   assert.match(calls[0].init.headers['User-Agent'], /^Mozilla\/5\.0/);
+});
+
+test('/proxy: respeta VIMEUS_REFERER e ignora un ?provider= heredado', async () => {
+  const playlist = ['#EXTM3U', '#EXTINF:4.0,', 'seg0.ts', '#EXT-X-ENDLIST'].join('\n');
+  const calls = mockFetch((url, init) => {
+    assert.equal(url, 'https://cdn.vimeus.test/master.m3u8');
+    assert.equal(init.headers.Referer, 'https://allowed.example/');
+    return new Response(playlist, {
+      status: 200,
+      headers: { 'Content-Type': 'application/vnd.apple.mpegurl' },
+    });
+  });
+
+  const res = await worker.fetch(
+    new Request(`${WORKER_URL}/proxy?url=${encodeURIComponent('https://cdn.vimeus.test/master.m3u8')}&provider=unlimplay`),
+    { VIMEUS_REFERER: 'https://allowed.example/' },
+    {},
+  );
+  assert.equal(res.status, 200);
+  const body = await res.text();
+  assert.ok(body.includes(`${WORKER_URL}/proxy?url=https%3A%2F%2Fcdn.vimeus.test%2Fseg0.ts`));
+  assert.equal(calls.length, 1);
 });
 
 test('/proxy: reenvía segmentos con Range y sin reescribir', async () => {
@@ -683,6 +660,16 @@ test('/proxy: valida parámetros y bloquea bucles', async () => {
     (await call(`/proxy?url=${encodeURIComponent(`${WORKER_URL}/proxy?url=x`)}`)).status,
     400,
   );
+});
+
+test('/proxy: funciona aunque falte la view_key (sólo necesita Referer/UA)', async () => {
+  mockFetch(() => new Response(new Uint8Array([9]), { status: 200, headers: { 'Content-Type': 'video/mp2t' } }));
+  const res = await worker.fetch(
+    new Request(`${WORKER_URL}/proxy?url=${encodeURIComponent('https://cdn.example.net/s/seg1.ts')}`),
+    { VIMEUS_VIEW_KEY: '' },
+    {},
+  );
+  assert.equal(res.status, 200);
 });
 
 test('/proxy: fallo del CDN → 502 JSON (no rompe el Worker)', async () => {
@@ -715,7 +702,7 @@ test('regresión: un mensaje de error con Unicode no rompe la cabecera HTTP', as
 test('regresión: ids con mayúsculas no se pierden al enrutar', async () => {
   const calls = mockFetch(() => htmlResponse(EMBED_HTML));
   await call('/stream/movie/TT9999999.json');
-  assert.equal(calls[0].url, 'https://unlimplay.com/f/embed/movie/TT9999999');
+  assert.equal(new URL(calls[0].url).searchParams.get('imdb'), 'TT9999999');
 });
 
 test('embed con HTML enorme: conserva cabeza y cola y sigue extrayendo', async () => {
@@ -735,10 +722,22 @@ test('raíz con Accept: text/html → consola de pruebas en HTML', async () => {
   assert.equal(res.headers.get('Access-Control-Allow-Origin'), '*');
   const html = await res.text();
   assert.match(html, /com\.cf\.unlimplay\.proxy/);
-  assert.match(html, /Vimeus \+ UnlimPlay HLS/);
+  assert.match(html, /Vimeus HLS/);
+  assert.ok(!/UnlimPlay/.test(html), 'la consola no menciona proveedores retirados');
   assert.ok(html.includes(`${WORKER_URL}/manifest.json`), 'debe mostrar la URL de instalación');
+  assert.ok(!html.includes(VIEW_KEY), 'la consola no expone la view_key');
   assert.match(html, /<input id="mid"/);
   assert.match(html, /X-Proxy-Detail/);
+});
+
+test('raíz sin view_key: la consola avisa de que falta configurarla', async () => {
+  const res = await worker.fetch(
+    new Request(`${WORKER_URL}/`, { headers: { Accept: 'text/html' } }),
+    { VIMEUS_VIEW_KEY: '' },
+    {},
+  );
+  const html = await res.text();
+  assert.match(html, /no configurada/);
 });
 
 test('raíz con Accept: application/json → healthcheck JSON', async () => {
@@ -746,7 +745,7 @@ test('raíz con Accept: application/json → healthcheck JSON', async () => {
   assert.match(res.headers.get('Content-Type'), /application\/json/);
   const body = await res.json();
   assert.equal(body.status, 'ok');
-  assert.equal(body.source, 'https://unlimplay.com');
+  assert.equal(body.source, 'https://vimeus.com');
 });
 
 test('/index.json siempre devuelve JSON aunque se pida HTML', async () => {
@@ -755,9 +754,9 @@ test('/index.json siempre devuelve JSON aunque se pida HTML', async () => {
   assert.equal((await res.json()).status, 'ok');
 });
 
-test('SOURCE_ORIGIN por env se refleja en el manifiesto y en el embed', async () => {
+test('VIMEUS_ORIGIN por env se refleja en el manifiesto y en el embed', async () => {
   const calls = mockFetch(() => htmlResponse(EMBED_HTML));
-  const env = { SOURCE_ORIGIN: 'https://mirror.example.org' };
+  const env = { VIMEUS_ORIGIN: 'https://mirror.example.org/' };
 
   const manifest = await (
     await worker.fetch(new Request(`${WORKER_URL}/manifest.json`), env, {})
@@ -770,6 +769,6 @@ test('SOURCE_ORIGIN por env se refleja en el manifiesto y en el embed', async ()
     {},
   );
   const { streams } = await res.json();
-  assert.equal(calls[0].url, 'https://mirror.example.org/f/embed/movie/tt1234567');
+  assert.equal(new URL(calls[0].url).origin, 'https://mirror.example.org');
   assert.equal(streams[0].behaviorHints.requestHeaders.Referer, 'https://mirror.example.org/');
 });
