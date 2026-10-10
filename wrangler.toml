@@ -40,8 +40,15 @@ PROXY_HLS = "0"
 VERIFY_HLS = "1"
 
 # "1" → si el HTML del embed no trae el .m3u8, sigue iframes/configuración
-# del reproductor (máximo 4 peticiones extra).
+# del reproductor. Vimeus es un agregador: el HLS real está en el iframe del
+# host de terceros, así que el deep scan es la ruta habitual. Déjalo en "1".
 DEEP_SCAN = "1"
+
+# Nº máximo de páginas extra (iframes/APIs) que sigue el deep scan.
+MAX_DEEP_SCAN = "6"
+
+# Token para /debug/{movie|series}/{id}?token=… (traza del scraping).
+# Configúralo como secreto sólo mientras depuras: npx wrangler secret put DEBUG_TOKEN
 
 # Nº máximo de candidatos .m3u8 devueltos como streams alternativos.
 MAX_STREAMS = "3"

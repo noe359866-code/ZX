@@ -325,25 +325,48 @@ test('VERIFY_HLS prueba /e/anime si el HLS de /e/serie está vencido', async () 
   );
   const body = await res.json();
   assert.equal(body.streams[0].url, 'https://cdn.vimeus.test/valid.m3u8');
+  // /e/serie y /e/anime se piden en paralelo; después se verifican las playlists.
   assert.deepEqual(calls.map((c) => new URL(c.url).pathname), [
-    '/e/serie', '/expired.m3u8', '/e/anime', '/valid.m3u8',
+    '/e/serie', '/e/anime', '/expired.m3u8', '/valid.m3u8',
   ]);
 });
 
-test('series: traduce id:temporada:episodio con IMDb a /e/serie', async () => {
+test('series: traduce id:temporada:episodio con IMDb y consulta /e/serie y /e/anime en paralelo', async () => {
   const calls = mockFetch((url) => {
     const parsed = new URL(url);
-    assert.equal(parsed.pathname, '/e/serie');
     assert.equal(parsed.searchParams.get('imdb'), 'tt0903747');
     assert.equal(parsed.searchParams.get('se'), '1');
     assert.equal(parsed.searchParams.get('ep'), '2');
+    // Catálogos disjuntos: el que no corresponde responde 404 de inmediato.
+    if (parsed.pathname === '/e/anime') return new Response('Not Found', { status: 404 });
+    assert.equal(parsed.pathname, '/e/serie');
     return htmlResponse('<script>player.setup({file:"https://cdn.example.net/episode.m3u8"})</script>');
   });
 
   const res = await call('/stream/series/tt0903747:1:2.json');
   const { streams } = await res.json();
   assert.equal(streams.length, 1);
-  assert.equal(calls.length, 1);
+  assert.deepEqual(calls.map((c) => new URL(c.url).pathname).sort(), ['/e/anime', '/e/serie']);
+});
+
+test('series: un título que sólo existe en /e/anime se resuelve igual', async () => {
+  const calls = mockFetch((url) => {
+    const parsed = new URL(url);
+    if (parsed.pathname === '/e/serie') return new Response('Not Found', { status: 404 });
+    return htmlResponse('<script>player.setup({file:"https://cdn.example.net/anime.m3u8"})</script>');
+  });
+  const res = await call('/stream/series/tmdb:37854:1:1.json');
+  const { streams } = await res.json();
+  assert.equal(streams[0].url, 'https://cdn.example.net/anime.m3u8');
+  assert.equal(calls.length, 2);
+});
+
+test('series: 404 en /e/serie y /e/anime → not-found con detalle claro', async () => {
+  mockFetch(() => new Response('Not Found', { status: 404 }));
+  const res = await call('/stream/series/tt0000001:1:1.json');
+  assert.deepEqual(await res.json(), { streams: [] });
+  assert.equal(res.headers.get('X-Proxy-Error'), 'not-found');
+  assert.match(res.headers.get('X-Proxy-Detail'), /404/);
 });
 
 test('series: también acepta tmdb id en segmentos y rechaza episodio incompleto', async () => {
@@ -357,14 +380,15 @@ test('series: también acepta tmdb id en segmentos y rechaza episodio incompleto
   assert.equal(first.searchParams.get('tmdb'), '1396');
   assert.equal(first.searchParams.get('se'), '1');
   assert.equal(first.searchParams.get('ep'), '1');
+  const requested = calls.length;
 
   const invalid = await call('/stream/series/tt0903747.json');
   assert.deepEqual(await invalid.json(), { streams: [] });
   assert.equal(invalid.headers.get('X-Proxy-Error'), 'bad-id');
-  assert.equal(calls.length, 1, 'no consulta el origen para un episodio incompleto');
+  assert.equal(calls.length, requested, 'no consulta el origen para un episodio incompleto');
 });
 
-test('los diagnósticos no filtran el view_key de un error Vimeus', async () => {
+test('403 de Vimeus → invalid-view-key sin filtrar la clave en el diagnóstico', async () => {
   const secret = 'private-view-key-value';
   mockFetch(() => new Response('no autorizado', { status: 403 }));
   const res = await worker.fetch(
@@ -373,9 +397,26 @@ test('los diagnósticos no filtran el view_key de un error Vimeus', async () => 
     {},
   );
   const detail = res.headers.get('X-Proxy-Detail') || '';
-  assert.equal(res.headers.get('X-Proxy-Error'), 'upstream');
+  assert.equal(res.headers.get('X-Proxy-Error'), 'invalid-view-key');
   assert.match(detail, /403/);
   assert.ok(!detail.includes(secret));
+});
+
+test('400 "view_key is required" (clave inválida) → invalid-view-key', async () => {
+  const calls = mockFetch(() => new Response('Bad Request: view_key is required.', { status: 400 }));
+  const res = await call('/stream/movie/tt1234567.json');
+  assert.deepEqual(await res.json(), { streams: [] });
+  assert.equal(res.headers.get('X-Proxy-Error'), 'invalid-view-key');
+  assert.match(res.headers.get('X-Proxy-Detail'), /VIMEUS_VIEW_KEY/);
+  assert.equal(calls.length, 1, 'sin deep scan ni reintentos');
+});
+
+test('404 de Vimeus en película → not-found sin deep scan', async () => {
+  const calls = mockFetch(() => new Response('Not Found', { status: 404 }));
+  const res = await call('/stream/movie/tt1234567.json');
+  assert.equal(res.headers.get('X-Proxy-Error'), 'not-found');
+  assert.match(res.headers.get('X-Proxy-Detail'), /404/);
+  assert.equal(calls.length, 1);
 });
 
 test('el id se limpia: tmdb:movie:550.json → tmdb=550', async () => {
@@ -710,6 +751,191 @@ test('embed con fuente HLS sin extensión .m3u8 (type: application/x-mpegURL)', 
   const { streams } = await res.json();
   assert.equal(streams[0].url, 'https://cdn.vimeus.test/vod/777/stream');
   assert.equal(streams[0].type, 'hls');
+});
+
+// ---------------------------------------------------------------------------
+// Vimeus como agregador: el HLS vive en un host de terceros
+// ---------------------------------------------------------------------------
+test('HLS hallado en un iframe de terceros: Referer/Origin del tercero, no de Vimeus', async () => {
+  const seen = {};
+  mockFetch((url, init) => {
+    seen[url] = init.headers;
+    if (url === EMBED_URL) return htmlResponse('<iframe src="https://streamhost.example/e/abc123"></iframe>');
+    if (url === 'https://streamhost.example/e/abc123') {
+      return htmlResponse('<script>jwplayer().setup({file:"https://cdn.streamhost.example/hls/abc123/master.m3u8?t=1"})</script>');
+    }
+    if (url === 'https://cdn.streamhost.example/hls/abc123/master.m3u8?t=1') {
+      return new Response('#EXTM3U\n#EXT-X-STREAM-INF:RESOLUTION=1280x720\n720.m3u8', { status: 200 });
+    }
+    throw new Error(`petición inesperada: ${url}`);
+  });
+
+  const res = await worker.fetch(
+    new Request(`${WORKER_URL}/stream/movie/tt1234567.json`),
+    { VERIFY_HLS: '1', VIMEUS_REFERER: 'https://misitio.example/' },
+    {},
+  );
+  const { streams } = await res.json();
+  assert.equal(streams.length, 1);
+  assert.equal(streams[0].title, 'Vimeus [HLS · 720p]');
+
+  // La verificación de la playlist usó el Referer del host de terceros.
+  const verify = seen['https://cdn.streamhost.example/hls/abc123/master.m3u8?t=1'];
+  assert.equal(verify.Referer, 'https://streamhost.example/');
+  assert.equal(verify.Origin, 'https://streamhost.example');
+
+  // Y Stremio recibe esas mismas cabeceras para reproducir.
+  assert.equal(streams[0].behaviorHints.requestHeaders.Referer, 'https://streamhost.example/');
+  assert.equal(streams[0].behaviorHints.proxyHeaders.request.Origin, 'https://streamhost.example');
+
+  // El embed de Vimeus, en cambio, se pidió con el Referer autorizado.
+  assert.equal(seen[EMBED_URL].Referer, 'https://misitio.example/');
+  // El iframe de terceros se pidió con el embed de Vimeus como Referer.
+  assert.equal(seen['https://streamhost.example/e/abc123'].Referer, EMBED_URL);
+});
+
+test('HLS hallado en la propia página de Vimeus conserva VIMEUS_REFERER', async () => {
+  mockFetch(() => htmlResponse('<script>p({file:"https://cdn.vimeus.test/direct.m3u8"})</script>'));
+  const res = await worker.fetch(
+    new Request(`${WORKER_URL}/stream/movie/tt1234567.json`),
+    { VIMEUS_REFERER: 'https://misitio.example/' },
+    {},
+  );
+  const { streams } = await res.json();
+  assert.equal(streams[0].behaviorHints.requestHeaders.Referer, 'https://misitio.example/');
+  assert.equal(streams[0].behaviorHints.proxyHeaders.request.Origin, 'https://vimeus.com');
+});
+
+test('PROXY_HLS=1 con HLS de terceros: la URL del proxy lleva ref=<origen del tercero>', async () => {
+  mockFetch((url) => {
+    if (url === EMBED_URL) return htmlResponse('<iframe src="https://streamhost.example/e/x"></iframe>');
+    return htmlResponse('<script>p({file:"https://cdn.streamhost.example/x/master.m3u8"})</script>');
+  });
+  const res = await worker.fetch(
+    new Request(`${WORKER_URL}/stream/movie/tt1234567.json`),
+    { PROXY_HLS: '1' },
+    {},
+  );
+  const { streams } = await res.json();
+  const proxied = new URL(streams[0].url);
+  assert.equal(proxied.pathname, '/proxy');
+  assert.equal(proxied.searchParams.get('url'), 'https://cdn.streamhost.example/x/master.m3u8');
+  assert.equal(proxied.searchParams.get('ref'), 'https://streamhost.example');
+});
+
+test('/proxy?ref=: aplica el Referer del tercero y lo propaga a las variantes', async () => {
+  const calls = mockFetch((url, init) => {
+    assert.equal(init.headers.Referer, 'https://streamhost.example/');
+    assert.equal(init.headers.Origin, 'https://streamhost.example');
+    return new Response('#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n720/index.m3u8\n', {
+      status: 200, headers: { 'Content-Type': 'application/vnd.apple.mpegurl' },
+    });
+  });
+  const target = 'https://cdn.streamhost.example/x/master.m3u8';
+  const res = await call(`/proxy?url=${encodeURIComponent(target)}&ref=${encodeURIComponent('https://streamhost.example')}`);
+  const body = await res.text();
+  assert.equal(res.status, 200);
+  assert.ok(body.includes(`${WORKER_URL}/proxy?url=https%3A%2F%2Fcdn.streamhost.example%2Fx%2F720%2Findex.m3u8&ref=https%3A%2F%2Fstreamhost.example`));
+  assert.equal(calls.length, 1);
+});
+
+test('/proxy?ref=: ignora valores inválidos o que apuntan al Worker', async () => {
+  const calls = mockFetch(() => new Response(new Uint8Array([1]), { status: 200, headers: { 'Content-Type': 'video/mp2t' } }));
+  for (const ref of ['javascript:alert(1)', WORKER_URL, 'nohost', 'ftp://x.y']) {
+    const res = await call(`/proxy?url=${encodeURIComponent('https://cdn.example.net/s.ts')}&ref=${encodeURIComponent(ref)}`);
+    assert.equal(res.status, 200);
+  }
+  for (const c of calls) assert.equal(c.init.headers.Referer, 'https://vimeus.com/');
+});
+
+test('deep scan: dos iframes (selector de servidores) se piden en el mismo lote', async () => {
+  const order = [];
+  mockFetch((url) => {
+    order.push(url);
+    if (url === EMBED_URL) {
+      return htmlResponse('<iframe src="https://host-a.example/e/1"></iframe><iframe src="https://host-b.example/e/2"></iframe>');
+    }
+    if (url === 'https://host-a.example/e/1') return htmlResponse('<p>servidor caído</p>');
+    if (url === 'https://host-b.example/e/2') {
+      return htmlResponse('<script>p({file:"https://cdn.hostb.example/v/master.m3u8"})</script>');
+    }
+    throw new Error(`petición inesperada: ${url}`);
+  });
+  const res = await call('/stream/movie/tt1234567.json');
+  const { streams } = await res.json();
+  assert.equal(streams[0].url, 'https://cdn.hostb.example/v/master.m3u8');
+  assert.equal(streams[0].behaviorHints.requestHeaders.Referer, 'https://host-b.example/');
+  assert.equal(order.length, 3);
+});
+
+test('MAX_DEEP_SCAN acota las peticiones del deep scan', async () => {
+  const calls = mockFetch((url) => {
+    if (url === EMBED_URL) {
+      return htmlResponse([1, 2, 3, 4, 5, 6, 7, 8].map((i) => `<iframe src="/embed/s${i}"></iframe>`).join(''));
+    }
+    return htmlResponse('<p>nada</p>');
+  });
+  const res = await worker.fetch(
+    new Request(`${WORKER_URL}/stream/movie/tt1234567.json`),
+    { MAX_DEEP_SCAN: '3' },
+    {},
+  );
+  assert.deepEqual(await res.json(), { streams: [] });
+  assert.equal(calls.length, 1 + 3);
+});
+
+// ---------------------------------------------------------------------------
+// /debug — traza protegida por DEBUG_TOKEN
+// ---------------------------------------------------------------------------
+test('/debug: 404 sin DEBUG_TOKEN configurado o con token incorrecto', async () => {
+  const calls = mockFetch(() => htmlResponse(EMBED_HTML));
+  assert.equal((await call('/debug/movie/tt1234567?token=abc')).status, 404);
+  const wrong = await worker.fetch(new Request(`${WORKER_URL}/debug/movie/tt1234567?token=nope`), { DEBUG_TOKEN: 'abc' }, {});
+  assert.equal(wrong.status, 404);
+  const missing = await worker.fetch(new Request(`${WORKER_URL}/debug/movie/tt1234567`), { DEBUG_TOKEN: 'abc' }, {});
+  assert.equal(missing.status, 404);
+  assert.equal(calls.length, 0, 'sin token válido no se toca el origen');
+});
+
+test('/debug: devuelve la traza del scraping con secretos redactados', async () => {
+  mockFetch((url) => {
+    if (url === EMBED_URL) return htmlResponse('<iframe src="https://streamhost.example/e/abc"></iframe>');
+    if (url === 'https://streamhost.example/e/abc') {
+      return htmlResponse('<script>p({file:"https://cdn.streamhost.example/m.m3u8?token=secreto"})</script>');
+    }
+    return new Response('#EXTM3U\n#EXTINF:4,\nx.ts\n#EXT-X-ENDLIST', { status: 200 });
+  });
+
+  const res = await worker.fetch(
+    new Request(`${WORKER_URL}/debug/movie/tt1234567?token=abc&html=1`),
+    { DEBUG_TOKEN: 'abc', VERIFY_HLS: '1' },
+    {},
+  );
+  assert.equal(res.status, 200);
+  const text = await res.text();
+  assert.ok(!text.includes(VIEW_KEY), 'la view_key no aparece');
+  assert.ok(!text.includes('token=secreto'), 'los tokens se redactan');
+  const body = JSON.parse(text);
+  assert.equal(body.provider.viewKey, 'configured');
+  assert.equal(body.embeds.length, 1);
+  assert.deepEqual(body.trace.map((s) => s.step), ['embed', 'scan', 'verify']);
+  assert.ok(body.trace[0].html.includes('<iframe'), 'html=1 incluye el HTML');
+  assert.deepEqual(body.trace[0].configUrls, ['https://streamhost.example/e/abc']);
+  assert.equal(body.trace[1].candidates.length, 1);
+  assert.equal(body.result.code, null);
+  assert.equal(body.result.streams[0].referer, 'https://streamhost.example/');
+});
+
+test('/debug sin view_key: informa missing-view-key sin tocar el origen', async () => {
+  const calls = mockFetch(() => htmlResponse(EMBED_HTML));
+  const res = await worker.fetch(
+    new Request(`${WORKER_URL}/debug/movie/tt1234567?token=abc`),
+    { DEBUG_TOKEN: 'abc', VIMEUS_VIEW_KEY: '' },
+    {},
+  );
+  const body = await res.json();
+  assert.equal(body.result.code, 'missing-view-key');
+  assert.equal(calls.length, 0);
 });
 
 // ---------------------------------------------------------------------------

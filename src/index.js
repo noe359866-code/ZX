@@ -104,12 +104,39 @@ export function resolveVimeusSource(env) {
 /** Alias de compatibilidad: el único proveedor del addon es Vimeus. */
 export const resolveSource = resolveVimeusSource;
 
+/**
+ * Contexto de reproducción de un HLS: qué Referer/Origin espera su CDN.
+ *
+ * Vimeus es un agregador: el .m3u8 real lo sirve un host de terceros alcanzado
+ * a través de iframes. Ese CDN valida el Referer de *su* página de embed, no el
+ * de Vimeus. Si la playlist se encontró en una página de otro origen, usamos
+ * ese origen; si se encontró en Vimeus, respetamos VIMEUS_REFERER.
+ *
+ * @param {object} source proveedor
+ * @param {string} [pageUrl] URL de la página donde apareció la playlist
+ * @returns {{referer: string, origin: string}}
+ */
+function playbackContext(source, pageUrl) {
+  if (pageUrl) {
+    try {
+      const page = new URL(pageUrl);
+      if ((page.protocol === 'http:' || page.protocol === 'https:') && page.origin !== source.origin) {
+        return { referer: `${page.origin}/`, origin: page.origin };
+      }
+    } catch {
+      /* URL inválida: se usa el contexto del proveedor */
+    }
+  }
+  return { referer: source.referer, origin: source.origin };
+}
+
 /** Cabeceras que Stremio/ffmpeg deben enviar al pedir el .m3u8 y sus segmentos. */
-function playbackHeaders(source) {
+function playbackHeaders(source, pageUrl) {
+  const context = playbackContext(source, pageUrl);
   return {
-    Referer: source.referer,
+    Referer: context.referer,
     'User-Agent': BROWSER_UA,
-    Origin: source.origin,
+    Origin: context.origin,
     'Accept-Language': 'en-US,en;q=0.9',
   };
 }
@@ -183,9 +210,11 @@ const CORS_HEADERS = Object.freeze({
 const LIMITS = Object.freeze({
   fetchTimeoutMs: 9_000, // aborta peticiones colgadas
   maxBodyChars: 3_000_000, // no procesamos HTML gigante
-  maxDeepScanRequests: 4, // peticiones extra para seguir iframes/configuración
+  maxDeepScanRequests: 6, // peticiones extra para seguir iframes/configuración (MAX_DEEP_SCAN)
+  deepScanConcurrency: 2, // páginas del deep scan que se piden a la vez
   maxConfigUrls: 12, // referencias más prometedoras que se pueden encolar
   defaultMaxStreams: 3, // candidatos alternativos devueltos
+  debugHtmlChars: 24_000, // HTML por página que devuelve /debug con html=1
 });
 
 // ---------------------------------------------------------------------------
@@ -1022,6 +1051,13 @@ async function fetchText(url, headers, timeoutMs = LIMITS.fetchTimeoutMs) {
     const error = new Error(`HTTP ${response.status} ${response.statusText} en ${redactSecrets(url)}`);
     error.status = response.status;
     error.url = url;
+    // Un fragmento del cuerpo permite distinguir "view_key is required" de
+    // otros 400 sin exponer nada sensible (se redacta y se acota).
+    try {
+      error.body = redactSecrets((await response.text()).slice(0, 512));
+    } catch {
+      error.body = '';
+    }
     throw error;
   }
 
@@ -1068,9 +1104,14 @@ export function buildManifest(env) {
 function buildStream(m3u8Url, index, workerUrl, env, source, meta = {}) {
   const useProxy = envFlag(env?.PROXY_HLS, false);
   const notWebReady = useProxy ? false : envFlag(env?.NOT_WEB_READY, true);
+  const referer = meta?.referer || source.referer;
+  const origin = meta?.origin || source.origin;
 
+  // En modo proxy el Worker necesita saber qué Referer espera el CDN del HLS;
+  // sólo se añade `ref` cuando difiere del proveedor (host de terceros).
   const proxyUrl = new URL('/proxy', workerUrl.origin);
   proxyUrl.searchParams.set('url', m3u8Url);
+  if (origin !== source.origin) proxyUrl.searchParams.set('ref', origin);
   const finalUrl = useProxy ? proxyUrl.toString() : m3u8Url;
 
   const tags = ['HLS'];
@@ -1088,14 +1129,14 @@ function buildStream(m3u8Url, index, workerUrl, env, source, meta = {}) {
       notSupported: false,
       notWebReady,
       requestHeaders: {
-        Referer: source.referer,
+        Referer: referer,
         'User-Agent': BROWSER_UA,
       },
       proxyHeaders: {
         request: {
-          Referer: source.referer,
+          Referer: referer,
           'User-Agent': BROWSER_UA,
-          Origin: source.origin,
+          Origin: origin,
         },
       },
       bingeGroup: `${source.key}-${index}`,
@@ -1148,94 +1189,189 @@ function responsePlaylistUrl(result, requestedUrl) {
     : null;
 }
 
+/** Clasifica el error HTTP del embed de Vimeus en un código estable. */
+function classifyEmbedError(error) {
+  const status = Number(error?.status);
+  const body = String(error?.body ?? '').toLowerCase();
+  if (status === 400 && body.includes('view_key')) return 'invalid-view-key';
+  if (status === 401 || status === 403) return 'invalid-view-key';
+  if (status === 404) return 'not-found';
+  return status ? `http-${status}` : error?.code || 'upstream-error';
+}
+
 /**
- * Resuelve `/stream/movie/{id}.json` y `/stream/series/{id}:{season}:{episode}.json`.
- *
- * @param {string} rawId
- * @param {string} type
- * @param {Request} request
- * @param {object} env
- * @returns {Promise<Response>}
+ * Analiza una página (embed o subdocumento) y devuelve candidatos HLS con la
+ * URL de la página donde aparecieron (necesaria para el Referer de reproducción).
  */
-async function resolveProviderUrls(source, kind, coordinates, workerUrl, env, maxStreams) {
-  const embedUrls = source.embedUrlsFor(
-    kind,
-    coordinates.id,
-    coordinates.season,
-    coordinates.episode,
-  );
-  let lastError = null;
-  let deepScanBudget = LIMITS.maxDeepScanRequests;
+function collectCandidates(page, pageUrl, maxStreams) {
+  let urls = extractM3u8Urls(page.body, pageUrl, { max: maxStreams * 4 });
+  if (urls.length === 0) {
+    const directPlaylist = responsePlaylistUrl(page, pageUrl);
+    if (directPlaylist) urls = [directPlaylist];
+  }
+  return urls.map((url) => ({ url, pageUrl }));
+}
 
-  for (const embedUrl of embedUrls) {
+/**
+ * Resuelve los candidatos HLS de un título.
+ *
+ * Flujo (Vimeus es un agregador de embeds de terceros):
+ *   1. Se piden en paralelo todas las rutas de embed (/e/serie y /e/anime son
+ *      catálogos disjuntos: una responde 404 de inmediato).
+ *   2. En cada página se buscan playlists; si no hay, el deep scan sigue
+ *      iframes/API hasta el host de terceros que realmente sirve el HLS.
+ *   3. Los candidatos se verifican con el Referer de la página donde se
+ *      encontraron y se etiquetan con su calidad.
+ *
+ * @param {object} source
+ * @param {string} kind 'movie' | 'series'
+ * @param {{id:string, season:number|null, episode:number|null}} coordinates
+ * @param {URL} workerUrl
+ * @param {object} env
+ * @param {number} maxStreams
+ * @param {Array|null} [trace] si se pasa, recibe los pasos (para /debug)
+ * @returns {Promise<{urls: string[], meta: Map<string, object>, error: Error|null, code: string|null}>}
+ */
+async function resolveProviderUrls(source, kind, coordinates, workerUrl, env, maxStreams, trace = null) {
+  const embedUrls = source.embedUrlsFor(kind, coordinates.id, coordinates.season, coordinates.episode);
+  const deepScanEnabled = envFlag(env?.DEEP_SCAN, true);
+  let deepScanBudget = envInt(env?.MAX_DEEP_SCAN, LIMITS.maxDeepScanRequests);
+  const concurrency = LIMITS.deepScanConcurrency;
+
+  const isWorkerUrl = (target) => {
     try {
-      const firstPage = await fetchText(embedUrl, scrapeHeaders(source));
-      const firstPageUrl = firstPage.response.url || embedUrl;
-      let urls = extractM3u8Urls(firstPage.body, firstPageUrl, { max: maxStreams * 4 });
-      if (urls.length === 0) {
-        const directPlaylist = responsePlaylistUrl(firstPage, firstPageUrl);
-        if (directPlaylist) urls = [directPlaylist];
-      }
+      return new URL(target).origin === workerUrl.origin;
+    } catch {
+      return true;
+    }
+  };
+  const record = (entry) => {
+    if (trace) trace.push(entry);
+  };
 
-      let scanError = null;
-      if (urls.length === 0 && deepScanBudget > 0 && envFlag(env?.DEEP_SCAN, true)) {
-        const isWorkerUrl = (target) => {
-          try {
-            return new URL(target).origin === workerUrl.origin;
-          } catch {
-            return true;
-          }
-        };
-        const queue = findConfigUrls(firstPage.body, firstPageUrl)
-          .filter((target) => !isWorkerUrl(target))
-          .map((url) => ({ url, referer: firstPageUrl }));
-        const visited = new Set([embedUrl, firstPageUrl]);
-        const queued = new Set(queue.map((item) => item.url));
+  // 1. Embeds en paralelo.
+  const settled = await Promise.allSettled(
+    embedUrls.map((embedUrl) => fetchText(embedUrl, scrapeHeaders(source))),
+  );
 
-        while (queue.length > 0 && deepScanBudget > 0 && urls.length === 0) {
+  const codes = [];
+  let lastError = null;
+
+  for (let i = 0; i < settled.length; i++) {
+    const embedUrl = embedUrls[i];
+    const outcome = settled[i];
+
+    if (outcome.status === 'rejected') {
+      const error = outcome.reason;
+      const code = classifyEmbedError(error);
+      codes.push(code);
+      lastError = error;
+      record({ step: 'embed', url: redactSecrets(embedUrl), status: error?.status ?? null, code });
+      continue;
+    }
+
+    const firstPage = outcome.value;
+    const firstPageUrl = firstPage.response.url || embedUrl;
+    let candidates = collectCandidates(firstPage, firstPageUrl, maxStreams);
+    const firstConfigUrls = candidates.length === 0 ? findConfigUrls(firstPage.body, firstPageUrl) : [];
+    record({
+      step: 'embed',
+      url: redactSecrets(embedUrl),
+      finalUrl: redactSecrets(firstPageUrl),
+      status: firstPage.response.status,
+      bytes: firstPage.body.length,
+      candidates: candidates.map((c) => redactSecrets(c.url)),
+      configUrls: firstConfigUrls.map(redactSecrets),
+      html: trace?.withHtml ? redactSecrets(firstPage.body.slice(0, LIMITS.debugHtmlChars)) : undefined,
+    });
+
+    // 2. Deep scan: cola priorizada, en pequeños lotes concurrentes.
+    if (candidates.length === 0 && deepScanEnabled && deepScanBudget > 0) {
+      const queue = firstConfigUrls
+        .filter((target) => !isWorkerUrl(target))
+        .map((url) => ({ url, referer: firstPageUrl }));
+      const visited = new Set([embedUrl, firstPageUrl]);
+      const queued = new Set(queue.map((item) => item.url));
+
+      while (queue.length > 0 && deepScanBudget > 0 && candidates.length === 0) {
+        const batch = [];
+        while (batch.length < concurrency && queue.length > 0 && deepScanBudget > 0) {
           const next = queue.shift();
           if (!next || visited.has(next.url)) continue;
           visited.add(next.url);
           deepScanBudget--;
+          batch.push(next);
+        }
+        if (batch.length === 0) break;
 
-          try {
-            const page = await fetchText(next.url, deepScanHeaders(source, next.url, next.referer));
-            const pageUrl = page.response.url || next.url;
-            urls = extractM3u8Urls(page.body, pageUrl, { max: maxStreams * 4 });
-            if (urls.length === 0) {
-              const directPlaylist = responsePlaylistUrl(page, pageUrl);
-              if (directPlaylist) urls = [directPlaylist];
-            }
+        const results = await Promise.allSettled(
+          batch.map((item) => fetchText(item.url, deepScanHeaders(source, item.url, item.referer))),
+        );
 
-            if (urls.length === 0 && deepScanBudget > 0) {
-              for (const relatedUrl of findConfigUrls(page.body, pageUrl)) {
-                if (isWorkerUrl(relatedUrl) || visited.has(relatedUrl) || queued.has(relatedUrl)) continue;
-                queued.add(relatedUrl);
-                queue.push({ url: relatedUrl, referer: pageUrl });
-              }
-            }
-          } catch (err) {
-            scanError = err;
-            lastError = err;
-            console.warn(
-              `[${source.key}] deep-scan failed for id=${coordinates.id}: ${safeDiagnostic(err?.message)}`,
-            );
+        for (let j = 0; j < results.length; j++) {
+          const item = batch[j];
+          const result = results[j];
+          if (result.status === 'rejected') {
+            lastError = result.reason;
+            record({ step: 'scan', url: redactSecrets(item.url), status: result.reason?.status ?? null, error: safeDiagnostic(result.reason?.message) });
+            console.warn(`[${source.key}] deep-scan failed for id=${coordinates.id}: ${safeDiagnostic(result.reason?.message)}`);
+            continue;
+          }
+
+          const page = result.value;
+          const pageUrl = page.response.url || item.url;
+          const found = collectCandidates(page, pageUrl, maxStreams);
+          const related = found.length === 0 ? findConfigUrls(page.body, pageUrl) : [];
+          record({
+            step: 'scan',
+            url: redactSecrets(item.url),
+            finalUrl: redactSecrets(pageUrl),
+            status: page.response.status,
+            bytes: page.body.length,
+            candidates: found.map((c) => redactSecrets(c.url)),
+            configUrls: related.map(redactSecrets),
+            html: trace?.withHtml ? redactSecrets(page.body.slice(0, LIMITS.debugHtmlChars)) : undefined,
+          });
+
+          if (found.length > 0 && candidates.length === 0) {
+            candidates = found;
+            continue;
+          }
+          for (const relatedUrl of related) {
+            if (isWorkerUrl(relatedUrl) || visited.has(relatedUrl) || queued.has(relatedUrl)) continue;
+            queued.add(relatedUrl);
+            queue.push({ url: relatedUrl, referer: pageUrl });
           }
         }
       }
-
-      if (scanError) lastError = scanError;
-      if (urls.length > 0) {
-        const checked = await verifyHlsCandidates(source, urls, maxStreams, env);
-        if (checked.urls.length > 0) return { urls: checked.urls, meta: checked.meta, error: null };
-        if (checked.error) lastError = checked.error;
-      }
-    } catch (err) {
-      lastError = err;
     }
+
+    if (candidates.length === 0) {
+      codes.push('no-hls');
+      continue;
+    }
+
+    // 3. Verificación con el Referer de la página de origen de cada candidato.
+    const checked = await verifyHlsCandidates(source, candidates, maxStreams, env);
+    record({
+      step: 'verify',
+      verified: checked.urls.map(redactSecrets),
+      error: checked.error ? safeDiagnostic(checked.error.message) : undefined,
+    });
+    if (checked.urls.length > 0) return { urls: checked.urls, meta: checked.meta, error: null, code: null };
+    if (checked.error) lastError = checked.error;
+    codes.push(checked.error?.code || 'invalid-hls');
   }
 
-  return { urls: [], meta: new Map(), error: lastError };
+  // Código global: una clave inválida manda sobre todo; si todas las rutas
+  // dieron 404 el título no está en el catálogo; si hubo páginas sin HLS, no-hls.
+  let code = null;
+  if (codes.includes('invalid-view-key')) code = 'invalid-view-key';
+  else if (codes.length > 0 && codes.every((c) => c === 'not-found')) code = 'not-found';
+  else if (codes.includes('no-hls')) code = 'no-hls';
+  else code = codes.at(-1) || 'upstream-error';
+
+  return { urls: [], meta: new Map(), error: lastError, code };
 }
 
 /**
@@ -1269,16 +1405,29 @@ export function describePlaylist(body) {
 }
 
 /**
- * Pide cada playlist (en paralelo) con las cabeceras del proveedor para
- * detectar HLS caducado o páginas HTML disfrazadas, y aprovecha el cuerpo para
- * etiquetar la calidad. Conserva el orden de confianza de los candidatos.
+ * Pide cada playlist (en paralelo) con el Referer de la página donde apareció,
+ * para detectar HLS caducado o páginas HTML disfrazadas, y aprovecha el cuerpo
+ * para etiquetar la calidad. Conserva el orden de confianza de los candidatos.
  *
+ * @param {object} source
+ * @param {Array<{url: string, pageUrl?: string}|string>} candidates
  * @returns {Promise<{urls: string[], meta: Map<string, object>, error: Error|null}>}
  */
-async function verifyHlsCandidates(source, urls, maxStreams, env) {
-  if (!envFlag(env?.VERIFY_HLS, true)) return { urls, meta: new Map(), error: null };
+async function verifyHlsCandidates(source, candidates, maxStreams, env) {
+  const items = candidates.map((c) => (typeof c === 'string' ? { url: c, pageUrl: '' } : c));
 
-  const verifyOne = async (candidate) => {
+  if (!envFlag(env?.VERIFY_HLS, true)) {
+    const meta = new Map();
+    const urls = [];
+    for (const item of items) {
+      if (meta.has(item.url)) continue;
+      urls.push(item.url);
+      meta.set(item.url, { quality: '', variants: 0, live: false, ...playbackContext(source, item.pageUrl) });
+    }
+    return { urls, meta, error: null };
+  }
+
+  const verifyOne = async ({ url: candidate, pageUrl }) => {
     let parsed;
     try {
       parsed = new URL(candidate);
@@ -1296,7 +1445,7 @@ async function verifyHlsCandidates(source, urls, maxStreams, env) {
 
     try {
       const result = await fetchText(candidate, {
-        ...playbackHeaders(source),
+        ...playbackHeaders(source, pageUrl),
         Accept: 'application/vnd.apple.mpegurl, application/x-mpegURL, */*;q=0.8',
       });
       const body = result.body.replace(/^\uFEFF/, '').trimStart();
@@ -1312,13 +1461,13 @@ async function verifyHlsCandidates(source, urls, maxStreams, env) {
         error.code = 'invalid-hls-url';
         return { error };
       }
-      return { url: finalUrl, meta: describePlaylist(body) };
+      return { url: finalUrl, meta: { ...describePlaylist(body), ...playbackContext(source, pageUrl) } };
     } catch (error) {
       return { error };
     }
   };
 
-  const outcomes = await Promise.all(urls.slice(0, maxStreams).map(verifyOne));
+  const outcomes = await Promise.all(items.slice(0, maxStreams).map(verifyOne));
 
   const verified = [];
   const meta = new Map();
@@ -1335,6 +1484,78 @@ async function verifyHlsCandidates(source, urls, maxStreams, env) {
   }
 
   return { urls: verified, meta, error: verified.length > 0 ? null : lastError };
+}
+
+/**
+ * `/debug/{movie|series}/{id}?token=…[&html=1]` — traza completa del scraping.
+ *
+ * Pensado para afinar el extractor con datos reales: lista las páginas
+ * visitadas (embed, iframes, APIs), su estado HTTP, las URLs de configuración
+ * descubiertas y los candidatos HLS. Con `html=1` incluye el inicio del HTML
+ * de cada página (acotado). Sólo responde si DEBUG_TOKEN está configurado y
+ * coincide; la view_key y los tokens se redactan en toda la salida.
+ */
+async function handleDebug(rawId, type, url, env) {
+  const expected = String(env?.DEBUG_TOKEN || '').trim();
+  const provided = String(url.searchParams.get('token') || '').trim();
+  if (!expected || !provided || expected !== provided) {
+    return jsonResponse({ error: 'Not Found' }, 404);
+  }
+
+  const kind = type === 'tv' ? 'series' : type;
+  const coordinates = parseStreamRequest(rawId, kind);
+  if (!coordinates.id) return jsonResponse({ error: 'bad-id' }, 400);
+
+  const source = resolveVimeusSource(env);
+  const payload = {
+    addon: ADDON.version,
+    kind,
+    coordinates,
+    provider: { key: source.key, origin: source.origin, referer: source.referer, viewKey: source.viewKey ? 'configured' : 'missing' },
+    embeds: source.viewKey
+      ? source.embedUrlsFor(kind, coordinates.id, coordinates.season, coordinates.episode).map(redactSecrets)
+      : [],
+    settings: {
+      verifyHls: envFlag(env?.VERIFY_HLS, true),
+      deepScan: envFlag(env?.DEEP_SCAN, true),
+      maxDeepScan: envInt(env?.MAX_DEEP_SCAN, LIMITS.maxDeepScanRequests),
+      maxStreams: envInt(env?.MAX_STREAMS, LIMITS.defaultMaxStreams),
+    },
+    trace: [],
+    result: null,
+  };
+
+  if (!source.viewKey) {
+    payload.result = { code: 'missing-view-key' };
+    return jsonResponse(payload);
+  }
+
+  const trace = [];
+  trace.withHtml = envFlag(url.searchParams.get('html'), false);
+  const started = Date.now();
+  const result = await resolveProviderUrls(
+    source,
+    kind,
+    coordinates,
+    url,
+    env,
+    payload.settings.maxStreams,
+    trace,
+  );
+  payload.trace = trace;
+  payload.result = {
+    code: result.code,
+    elapsedMs: Date.now() - started,
+    error: result.error ? safeDiagnostic(result.error.message) : null,
+    streams: result.urls.map((u) => ({ url: redactSecrets(u), ...(result.meta.get(u) || {}) })),
+  };
+
+  // Red de seguridad: la clave jamás sale aunque algún campo la contuviera.
+  const json = JSON.stringify(payload, null, 2).split(source.viewKey).join('[redacted]');
+  return new Response(json, {
+    status: 200,
+    headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...CORS_HEADERS },
+  });
 }
 
 /**
@@ -1383,14 +1604,29 @@ async function handleStream(rawId, type, request, env) {
     });
   }
 
-  let errorCode = 'not-found';
-  let detail = 'no-hls';
-  if (result.error) {
-    const status = Number(result.error.status);
-    errorCode = 'upstream';
+  // Códigos estables para el cliente/consola:
+  //   invalid-view-key → Vimeus rechazó la clave (400 "view_key is required", 401/403)
+  //   not-found        → el título no está en el catálogo (404 en todas las rutas)
+  //   no-hls           → el embed respondió pero no se encontró/validó ninguna playlist
+  //   upstream         → error de red/HTTP distinto de los anteriores
+  const code = result.code || 'no-hls';
+  const status = Number(result.error?.status) || 0;
+  let errorCode;
+  if (code === 'invalid-view-key' || code === 'not-found') errorCode = code;
+  else if (result.error) errorCode = 'upstream';
+  else errorCode = 'not-found';
+
+  let detail;
+  if (code === 'invalid-view-key') {
+    detail = `Vimeus rechazó la petición${status ? ` (HTTP ${status})` : ''}: revisa VIMEUS_VIEW_KEY y VIMEUS_REFERER`;
+  } else if (code === 'not-found') {
+    detail = 'Vimeus no tiene este título (404)';
+  } else if (result.error) {
     detail = safeDiagnostic(
       result.error.message || (status ? `http-${status}` : result.error.code || 'upstream-error'),
     );
+  } else {
+    detail = code;
   }
 
   console.warn(`[${source.key}] sin HLS para id=${coordinates.id}; motivo=${errorCode}`);
@@ -1414,10 +1650,11 @@ async function handleStream(rawId, type, request, env) {
  * @param {string} workerOrigin origen del Worker, p.ej. https://x.workers.dev
  * @returns {string}
  */
-export function rewritePlaylist(text, playlistUrl, workerOrigin) {
+export function rewritePlaylist(text, playlistUrl, workerOrigin, ref = '') {
+  const refParam = ref ? `&ref=${encodeURIComponent(ref)}` : '';
   const proxify = (childUrl) => {
     const abs = absolutize(childUrl, playlistUrl);
-    return abs ? `${workerOrigin}/proxy?url=${encodeURIComponent(abs)}` : null;
+    return abs ? `${workerOrigin}/proxy?url=${encodeURIComponent(abs)}${refParam}` : null;
   };
 
   return String(text)
@@ -1439,6 +1676,19 @@ export function rewritePlaylist(text, playlistUrl, workerOrigin) {
       return rewritten ?? line;
     })
     .join('\n');
+}
+
+/** Valida el parámetro `ref` del proxy: sólo un origen http(s) ajeno al Worker. */
+function parseRefOrigin(raw, workerOrigin) {
+  if (!raw) return '';
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return '';
+    if (parsed.origin === workerOrigin || !parsed.hostname.includes('.')) return '';
+    return parsed.origin;
+  } catch {
+    return '';
+  }
 }
 
 /**
@@ -1468,12 +1718,14 @@ async function handleProxy(url, request, env) {
   // SSRF básico: no permitimos que el proxy apunte al propio Worker.
   if (abs.origin === url.origin) return jsonResponse({ error: 'Bucle de proxy no permitido' }, 400);
 
-  // Vimeus es el único proveedor: sus cabeceras se aplican a playlists y segmentos.
+  // `ref` = origen de la página de embed (de terceros) donde se halló el HLS;
+  // su CDN valida ese Referer. Sin `ref` se usan las cabeceras de Vimeus.
   // Se ignora un eventual `?provider=` heredado de enlaces antiguos.
   const source = resolveVimeusSource(env);
+  const ref = parseRefOrigin(url.searchParams.get('ref'), url.origin);
 
   try {
-    const headers = { ...playbackHeaders(source), Accept: '*/*' };
+    const headers = { ...playbackHeaders(source, ref ? `${ref}/` : ''), Accept: '*/*' };
     const range = request.headers.get('Range');
     if (range) headers.Range = range;
 
@@ -1505,7 +1757,7 @@ async function handleProxy(url, request, env) {
 
     const text = await upstream.text();
     const body = text.trimStart().startsWith('#EXTM3U')
-      ? rewritePlaylist(text, abs.toString(), url.origin)
+      ? rewritePlaylist(text, abs.toString(), url.origin, ref)
       : text;
 
     return new Response(body, {
@@ -1610,7 +1862,8 @@ export function healthHtml(info) {
       <li><code>GET /manifest.json</code></li>
       <li><code>GET /stream/movie/{id}.json</code></li>
       <li><code>GET /stream/series/{id}:{temporada}:{episodio}.json</code></li>
-      <li><code>GET /proxy?url=&lt;m3u8|segmento&gt;</code> — pasarela HLS</li>
+      <li><code>GET /proxy?url=&lt;m3u8|segmento&gt;[&amp;ref=&lt;origen&gt;]</code> — pasarela HLS</li>
+      <li><code>GET /debug/{movie|series}/{id}?token=…[&amp;html=1]</code> — traza de scraping (requiere <code>DEBUG_TOKEN</code>)</li>
       <li><code>OPTIONS *</code> — preflight CORS</li>
     </ul>
   </div>
@@ -1651,6 +1904,9 @@ document.getElementById('mid').addEventListener('keydown', function(e){
 
 /** /stream/[movie|series|tv]/{id}[.json] (series admite id:temporada:episodio). */
 const STREAM_ROUTE_RE = /^\/stream\/(?:(movie|series|tv|channel)\/)?(.+)$/i;
+
+/** /debug/[movie|series|tv]/{id} — traza de scraping protegida por DEBUG_TOKEN. */
+const DEBUG_ROUTE_RE = /^\/debug\/(movie|series|tv)\/(.+)$/i;
 
 export default {
   /**
@@ -1699,6 +1955,7 @@ export default {
             '/stream/movie/{id}.json',
             '/stream/series/{id}:{season}:{episode}.json',
             '/proxy?url=',
+            '/debug/{movie|series}/{id}?token= (requiere DEBUG_TOKEN)',
           ],
           install: `${url.origin}/manifest.json`,
         };
@@ -1732,6 +1989,12 @@ export default {
       // --- Pasarela HLS opcional -------------------------------------------
       if (path === '/proxy' || path === '/hls') {
         return await handleProxy(url, request, env);
+      }
+
+      // --- Traza de depuración (requiere DEBUG_TOKEN) -----------------------
+      const debugMatch = rawPath.match(DEBUG_ROUTE_RE);
+      if (debugMatch) {
+        return await handleDebug(debugMatch[2], debugMatch[1].toLowerCase(), url, env);
       }
 
       // --- 404 amigable -----------------------------------------------------

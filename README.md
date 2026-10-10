@@ -19,16 +19,29 @@ Stremio ──▶ /stream/movie/tt1234567.json ──▶ Worker
 | `GET` | `/manifest.json` | Manifiesto de Stremio. |
 | `GET` | `/stream/movie/{id}.json` | Resuelve una película y devuelve el HLS. |
 | `GET` | `/stream/series/{id}:{season}:{episode}.json` | Resuelve un episodio. |
-| `GET` | `/proxy?url=<URL>` | Pasarela HLS opcional para playlists, variantes y segmentos. |
+| `GET` | `/proxy?url=<URL>[&ref=<origen>]` | Pasarela HLS opcional para playlists, variantes y segmentos. `ref` es el origen del host de terceros cuyo Referer espera el CDN. |
+| `GET` | `/debug/{movie\|series}/{id}?token=…[&html=1]` | Traza completa del scraping (páginas visitadas, URLs descubiertas, candidatos, calidad). Requiere `DEBUG_TOKEN`. |
 | `GET` | `/` | Healthcheck JSON; con `Accept: text/html`, consola de prueba. |
 | `OPTIONS` | cualquier ruta | Preflight CORS. |
 
 Las respuestas del addon incluyen CORS. Cuando hay un stream, `X-Stream-Provider: vimeus` y `X-Candidates-Found` resumen el resultado.
 
-## Cómo se resuelve un stream
+## Cómo funciona Vimeus (y cómo lo aprovecha el addon)
 
-1. **Películas** → `/e/movie`.
-2. **Series/anime** → primero `/e/serie`; si no se encuentra (o no valida) un HLS, se prueba `/e/anime`.
+Comportamiento observado del servicio (octubre 2026):
+
+- Vimeus **no aloja vídeo**: es un agregador que "scrapea embeds de múltiples fuentes" (Doodstream, Streamwish, Voe, etc.) y los sirve con un reproductor propio con **selector de servidores** y **dominios rotativos**. La página `/e/…` renderiza el título en servidor y carga el player/servidores por JavaScript.
+- Consecuencia: el `.m3u8` **no está en la página de Vimeus**, sino 1–2 iframes más abajo, en el host de terceros. El **deep scan es la ruta normal**, no la excepción, y el `Referer` que valida el CDN del HLS es el de **ese host**, no el de Vimeus.
+- `/e/movie`, `/e/serie` y `/e/anime` aceptan `tmdb=` o `imdb=` (+ `se`/`ep`). **`/e/serie` y `/e/anime` son catálogos disjuntos**: *Breaking Bad* sólo existe en `serie`, *One Piece* sólo en `anime`; el otro responde `404 Not Found` de inmediato.
+- `view_key` ausente **o inválida** → `400 Bad Request: view_key is required.`; título inexistente → `404 Not Found`.
+- La `view_key` se valida por **Referer** (`referrerpolicy="origin"` en el iframe): si en el dashboard restringes dominios, el Referer debe ser exactamente el origen autorizado.
+
+Lo que hace el addon con eso:
+
+1. Pide los embeds en **paralelo** (`/e/serie` + `/e/anime` para series) y descarta de inmediato los 404.
+2. Extrae playlists de la página; si no hay, sigue iframes/APIs (en lotes de 2, hasta `MAX_DEEP_SCAN` páginas) **recordando en qué página apareció cada candidato**.
+3. Verifica cada candidato con el `Referer`/`Origin` de **su** página y entrega esas mismas cabeceras a Stremio (`requestHeaders`/`proxyHeaders`). En modo proxy, el enlace lleva `ref=<origen>` para que el Worker aplique el Referer correcto a variantes y segmentos.
+4. Clasifica el fallo sin trabajo inútil: `invalid-view-key` (400/401/403), `not-found` (404 en todas las rutas o sin playlist), `upstream` (red/HTTP/HLS caducado).
 
 El ID `tt…` se envía como `imdb`; un ID numérico, como `tmdb`. En todos los casos se añade `view_key`; para series también `se` y `ep`.
 
@@ -67,7 +80,26 @@ Ejemplo de respuesta:
 
 `PROXY_HLS=1` es útil para clientes que no pueden inyectar cabeceras, incluido Stremio Web: el enlace entregado a Stremio apunta a `/proxy`, y el Worker reescribe las playlists para que variantes y segmentos también pasen por él con el `Referer` de Vimeus.
 
-Si no se encuentra HLS, se devuelve `200 {"streams": []}` para no romper Stremio. Los detalles van en `X-Proxy-Error` (`missing-view-key`, `not-found`, `upstream`, `bad-id`) y `X-Proxy-Detail`. Las claves `view_key` y los tokens se eliminan de los diagnósticos.
+Si no se encuentra HLS, se devuelve `200 {"streams": []}` para no romper Stremio. Los detalles van en `X-Proxy-Error` y `X-Proxy-Detail`:
+
+| `X-Proxy-Error` | Significado |
+| --- | --- |
+| `missing-view-key` | No hay `VIMEUS_VIEW_KEY`; no se contacta con Vimeus. |
+| `invalid-view-key` | Vimeus respondió 400 "view_key is required" (clave incorrecta) o 401/403 (Referer no autorizado). Revisa `VIMEUS_VIEW_KEY` y `VIMEUS_REFERER`. |
+| `not-found` | 404 en todas las rutas (título fuera del catálogo) o embed sin ninguna playlist reconocible. |
+| `upstream` | Error de red/HTTP, o la playlist encontrada no validó (caducada, HTML disfrazado). |
+| `bad-id` | ID de Stremio no utilizable. |
+
+Las claves `view_key` y los tokens se eliminan de los diagnósticos.
+
+### Depurar un título concreto
+
+```bash
+npx wrangler secret put DEBUG_TOKEN        # elige un token largo
+curl -s "https://TU-WORKER.workers.dev/debug/movie/tt2395427?token=TU_TOKEN&html=1" | jq
+```
+
+La respuesta lista cada página visitada (`embed` → `scan` → `verify`) con estado HTTP, URLs de configuración/iframes descubiertas, candidatos HLS, la página de origen de cada stream y su calidad. Con `html=1` incluye los primeros 24 KB del HTML de cada página (con secretos redactados): es la forma de ver qué devuelve realmente Vimeus y su host de terceros para afinar el extractor. Sin `DEBUG_TOKEN` el endpoint responde 404.
 
 ## Extracción HLS
 
@@ -91,12 +123,14 @@ Los candidatos se absolutizan, validan como URLs HTTP(S) de playlist HLS, dedupl
 | --- | --- | --- |
 | `VIMEUS_VIEW_KEY` | — | Clave para el embed de Vimeus. **Obligatoria. Configúrala como secreto; no la guardes en Git ni la compartas en el chat.** |
 | `VIMEUS_ORIGIN` | `https://vimeus.com` | Origen de Vimeus. |
-| `VIMEUS_REFERER` | `https://vimeus.com/` | Referer enviado al pedir/reproducir el HLS. Si tu `view_key` tiene una lista de dominios permitidos, configúralo con el origen autorizado por Vimeus. |
+| `VIMEUS_REFERER` | `https://vimeus.com/` | Referer con el que se pide el embed de Vimeus (equivale al `referrerpolicy="origin"` del iframe). Si tu `view_key` tiene dominios permitidos, pon exactamente el origen autorizado, p. ej. `https://misitio.com/`. Para el HLS de terceros se usa automáticamente el origen del host donde apareció. |
 | `VIMEUS_MOVIE_PATH` | `/e/movie` | Ruta de película en Vimeus. |
 | `VIMEUS_SERIES_PATHS` | `/e/serie,/e/anime` | Rutas probadas para series/anime, en ese orden. |
 | `VIEW_KEY` | — | Alias heredado de `VIMEUS_VIEW_KEY`. |
 | `PROXY_HLS` | `0` | `1` → devolver HLS a través del proxy del Worker. |
-| `DEEP_SCAN` | `1` | `0` → no seguir referencias estáticas a iframes/configuración. |
+| `DEEP_SCAN` | `1` | `0` → no seguir iframes/configuración. Con Vimeus debe estar activo: el HLS vive en el iframe del tercero. |
+| `MAX_DEEP_SCAN` | `6` | Máximo de páginas extra que sigue el deep scan (se piden en lotes de 2). |
+| `DEBUG_TOKEN` | — | Habilita `/debug/...?token=`. Configúralo como secreto y sólo mientras depuras. |
 | `MAX_STREAMS` | `3` | Máximo de playlists alternativas devueltas. |
 | `VERIFY_HLS` | `1` | Solicita cada candidato y exige una respuesta HLS `#EXTM3U`. Usa `0` para desactivar la verificación. |
 | `NOT_WEB_READY` | `1` | En modo directo, marca el stream como no listo para navegador cuando requiere cabeceras. Se ignora con `PROXY_HLS=1`. |
@@ -144,7 +178,7 @@ Las pruebas mockeadas cubren `view_key` ausente/incorrecta, extracción de URLs,
 
 ## Notas
 
-- Timeout de 9 s por solicitud de origen; el deep scan está acotado a cuatro referencias.
+- Timeout de 9 s por solicitud de origen; el deep scan está acotado a `MAX_DEEP_SCAN` páginas (6 por defecto, en lotes de 2).
 - El Worker conserva las rutas originales de Stremio y el ID de manifiesto para no obligar a reinstalar el addon.
 - `X-Proxy-Detail` se limita y sanea; las claves y tokens no se exponen en esos diagnósticos.
 - Respeta los términos del proveedor y usa únicamente fuentes/contenidos para los que tengas autorización. Este addon no aloja ni distribuye archivos multimedia.

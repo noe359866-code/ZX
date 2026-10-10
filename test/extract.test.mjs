@@ -297,6 +297,13 @@ test('rewritePlaylist: proxifica variantes, segmentos y claves', () => {
   assert.ok(!out.includes('provider='), 'ya no se añade el parámetro provider');
 });
 
+test('rewritePlaylist: propaga ref= a variantes, segmentos y claves', () => {
+  const playlist = ['#EXTM3U', '#EXT-X-KEY:METHOD=AES-128,URI="key.php"', '#EXTINF:6.0,', 'seg0.ts'].join('\n');
+  const out = rewritePlaylist(playlist, 'https://cdn.example.net/hls/index.m3u8', 'https://w.dev', 'https://host.example');
+  assert.ok(out.includes('URI="https://w.dev/proxy?url=https%3A%2F%2Fcdn.example.net%2Fhls%2Fkey.php&ref=https%3A%2F%2Fhost.example"'));
+  assert.ok(out.includes('https://w.dev/proxy?url=https%3A%2F%2Fcdn.example.net%2Fhls%2Fseg0.ts&ref=https%3A%2F%2Fhost.example'));
+});
+
 test('rewritePlaylist: master con variantes absolutas', () => {
   const master = ['#EXTM3U', '#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1920x1080', '1080p.m3u8'].join('\n');
   const out = rewritePlaylist(master, 'https://cdn.example.net/m.m3u8', 'https://w.dev');
