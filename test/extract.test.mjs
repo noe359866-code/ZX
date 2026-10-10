@@ -13,6 +13,8 @@ import {
   findConfigUrls,
   rewritePlaylist,
   buildManifest,
+  resolveProviderOrder,
+  resolveVimeusSource,
 } from '../src/index.js';
 
 const BASE = 'https://unlimplay.com/f/embed/movie/tt1234567';
@@ -282,7 +284,7 @@ test('rewritePlaylist: proxifica variantes, segmentos y claves', () => {
 
   assert.ok(out.startsWith('#EXTM3U'));
   assert.ok(
-    out.includes('URI="https://w.dev/proxy?url=https%3A%2F%2Fcdn.example.net%2Fhls%2Ftt1%2Fkey.php%3Fk%3D1"'),
+    out.includes('URI="https://w.dev/proxy?url=https%3A%2F%2Fcdn.example.net%2Fhls%2Ftt1%2Fkey.php%3Fk%3D1&provider=unlimplay"'),
   );
   assert.ok(out.includes('https://w.dev/proxy?url=https%3A%2F%2Fcdn.example.net%2Fhls%2Ftt1%2Fseg0.ts'));
   assert.ok(out.includes('https://w.dev/proxy?url=https%3A%2F%2Fcdn.example.net%2Fhls%2Ftt1%2Fseg1.ts'));
@@ -303,7 +305,7 @@ test('rewritePlaylist: master con variantes absolutas', () => {
 test('buildManifest: cumple el contrato de Stremio', () => {
   const m = buildManifest();
   assert.equal(m.id, 'com.cf.unlimplay.proxy');
-  assert.equal(m.name, 'UnlimPlay Proxy Stream');
+  assert.equal(m.name, 'Vimeus + UnlimPlay HLS');
   assert.deepEqual(m.resources, ['stream']);
   assert.deepEqual(m.types, ['movie', 'series']);
   assert.deepEqual(m.idPrefixes, ['tt', 'tmdb:']);
@@ -335,6 +337,42 @@ test('truncateSmart: no modifica documentos pequeños', async () => {
   assert.equal(truncateSmart('abc', 1000), 'abc');
   assert.equal(truncateSmart('', 1000), '');
   assert.equal(truncateSmart(null, 1000), '');
+});
+
+// ---------------------------------------------------------------------------
+// Proveedores
+// ---------------------------------------------------------------------------
+test('resolveProviderOrder: Vimeus es principal y UnlimPlay fallback', () => {
+  assert.deepEqual(resolveProviderOrder({}), ['vimeus', 'unlimplay']);
+  assert.deepEqual(resolveProviderOrder({ PROVIDER_ORDER: 'unlimplay,vimeus,vimeus,other' }), [
+    'unlimplay',
+    'vimeus',
+  ]);
+});
+
+test('resolveVimeusSource: construye embeds IMDb/TMDb con view_key', () => {
+  const source = resolveVimeusSource({ VIMEUS_VIEW_KEY: 'test-key' });
+  assert.equal(source.origin, 'https://vimeus.com');
+
+  const movie = new URL(source.embedUrlsFor('movie', 'tt0133093')[0]);
+  assert.equal(movie.pathname, '/e/movie');
+  assert.equal(movie.searchParams.get('imdb'), 'tt0133093');
+  assert.equal(movie.searchParams.get('view_key'), 'test-key');
+
+  const series = source.embedUrlsFor('series', '1429', 2, 3).map((value) => new URL(value));
+  assert.deepEqual(series.map((url) => url.pathname), ['/e/serie', '/e/anime']);
+  for (const url of series) {
+    assert.equal(url.searchParams.get('tmdb'), '1429');
+    assert.equal(url.searchParams.get('se'), '2');
+    assert.equal(url.searchParams.get('ep'), '3');
+    assert.equal(url.searchParams.get('view_key'), 'test-key');
+  }
+});
+
+test('resolveVimeusSource: sin clave no crea una URL de embed', () => {
+  const source = resolveVimeusSource({});
+  assert.equal(source.viewKey, '');
+  assert.deepEqual(source.embedUrlsFor('movie', 'tt123'), []);
 });
 
 // ---------------------------------------------------------------------------

@@ -1,41 +1,21 @@
 /**
  * ============================================================================
- *  UnlimPlay Proxy Stream — Addon Proxy de Stremio (Cloudflare Worker)
+ *  Vimeus + UnlimPlay HLS — Addon Proxy de Stremio (Cloudflare Worker)
  * ============================================================================
  *
- *  Worker en formato ES Module que actúa como addon de Stremio:
+ *  El Worker prueba Vimeus primero y UnlimPlay como respaldo:
+ *    GET /manifest.json                              → manifiesto de Stremio
+ *    GET /stream/movie/{id}.json                     → resuelve HLS de película
+ *    GET /stream/series/{id}:{season}:{episode}.json → resuelve HLS de episodio
+ *    GET /proxy?url=<m3u8|segmento>&provider=<key>   → pasarela HLS opcional
  *
- *    GET /manifest.json                         → manifiesto oficial del addon
- *    GET /stream/movie/{id}.json                → extrae el .m3u8 de una película
- *    GET /stream/series/{id}:{season}:{episode}.json → extrae el HLS de un episodio
- *    GET /proxy?url=<m3u8|segmento>             → (opcional) pasarela HLS desde el edge
- *    OPTIONS *                         → preflight CORS
+ *  Vimeus usa un embed con VIMEUS_VIEW_KEY. Si la clave no está configurada, el
+ *  origen falla o no se encuentra HLS, se prueba UnlimPlay. El análisis es
+ *  estático: no ejecuta JavaScript ni crea/renueva tokens de sesión. Si ambos
+ *  fallan, el addon devuelve {"streams": []} en lugar de romper Stremio.
  *
- *  Flujo del endpoint /stream:
- *    1. Limpia el id recibido (quita prefijos "tmdb:", "movie:", ".json", etc.).
- *    2. Pide https://unlimplay.com/f/embed/movie/{id} desde el edge de
- *       Cloudflare con un User-Agent de navegador moderno + Referer.
- *    3. Normaliza el HTML (des-escapa "\/", "\u002F", "&#47;", concatenaciones
- *       JS tipo "a" + "b") y extrae la URL .m3u8 con expresiones regulares
- *       ordenadas por confianza.
- *    4. Devuelve la respuesta de Stremio con `behaviorHints.requestHeaders`
- *       para que el cliente reproduzca el HLS con Referer/UA correctos.
- *    5. Si algo falla → SIEMPRE {"streams": []} (nunca rompe el addon).
- *
- *  Variables de entorno (opcionales, en el panel de Workers → Settings):
- *    PROXY_HLS     "1" → la URL del stream apunta a /proxy (útil en Stremio Web,
- *                        que no puede inyectar cabeceras).   Por defecto "0".
- *    DEEP_SCAN     "1" → si el HTML no trae el .m3u8, sigue hasta 2 peticiones
- *                        de configuración/API del reproductor. Por defecto "1".
- *    MAX_STREAMS   "3" → cuántos candidatos .m3u8 devolver como streams.
- *    NOT_WEB_READY "1" → marca el stream como no reproducible en navegador
- *                        (correcto cuando se depende de requestHeaders).
- *    SOURCE_ORIGIN     → origen del embed. Por defecto "https://unlimplay.com".
- *    EMBED_PATH        → ruta de películas. Por defecto "/f/embed/movie/".
- *    TV_EMBED_PATH     → ruta de episodios. Por defecto "/f/embed/tv/".
- *
- *  Este archivo es 100 % autocontenido: se puede pegar tal cual en el editor
- *  del panel de Cloudflare Workers (Create Worker → pegar → Deploy).
+ *  La clave Vimeus debe configurarse como secreto del Worker; nunca en Git.
+ *  Este archivo es autocontenido y se puede pegar en el panel de Cloudflare.
  * ============================================================================
  */
 
@@ -45,45 +25,47 @@
 
 /** Identidad del addon según el protocolo de Stremio. */
 const ADDON = Object.freeze({
+  // Conservamos el id para que las instalaciones existentes de Stremio sigan
+  // reconociendo el addon después de actualizarlo.
   id: 'com.cf.unlimplay.proxy',
-  name: 'UnlimPlay Proxy Stream',
-  version: '1.1.0',
+  name: 'Vimeus + UnlimPlay HLS',
+  version: '1.2.0',
   description:
-    'Addon proxy que resuelve flujos HLS (.m3u8) desde el embed de UnlimPlay en el edge de Cloudflare.',
+    'Addon proxy de Stremio que resuelve HLS desde Vimeus y usa UnlimPlay como respaldo.',
   resources: ['stream'],
   types: ['movie', 'series'],
   idPrefixes: ['tt', 'tmdb:'],
   contactEmail: 'addon@example.com',
 });
 
-/**
- * Origen de vídeo embebido (valores por defecto exigidos por el addon).
- * Se pueden sobrescribir por variables de entorno porque este tipo de dominios
- * rota con frecuencia: así se cambia sin tocar el código.
- *   SOURCE_ORIGIN  → "https://unlimplay.com"
- *   EMBED_PATH     → "/f/embed/movie/"
- */
 const SOURCE_DEFAULTS = Object.freeze({
   origin: 'https://unlimplay.com',
   embedPath: '/f/embed/movie/',
   tvEmbedPath: '/f/embed/tv/',
 });
 
-/** User-Agent de navegador moderno (se usa para scrapear y para reproducir). */
+const VIMEUS_DEFAULTS = Object.freeze({
+  origin: 'https://vimeus.com',
+  moviePath: '/e/movie',
+  seriesPaths: ['/e/serie', '/e/anime'],
+});
+
+const DEFAULT_PROVIDER_ORDER = Object.freeze(['vimeus', 'unlimplay']);
+
+/** User-Agent de navegador moderno (se usa para solicitar y reproducir HLS). */
 const BROWSER_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36';
 
-/**
- * Resuelve la configuración del origen de vídeo a partir del entorno.
- *
- * @param {object} [env]
- * @returns {{origin: string, referer: string, embedPath: string, tvEmbedPath: string,
- *   embedUrl: (id: string) => string, embedUrlFor: (type: string, id: string, season?: number, episode?: number) => string}}
- */
+function normalizeOrigin(value, fallback) {
+  return String(value || fallback).trim().replace(/\/+$/, '');
+}
+
+/** Configuración del proveedor de respaldo UnlimPlay. */
 export function resolveSource(env) {
-  const origin = String(env?.SOURCE_ORIGIN || SOURCE_DEFAULTS.origin)
-    .trim()
-    .replace(/\/+$/, '');
+  const origin = normalizeOrigin(
+    env?.UNLIMPLAY_ORIGIN || env?.SOURCE_ORIGIN,
+    SOURCE_DEFAULTS.origin,
+  );
 
   const normalizePath = (value, fallback) => {
     let path = String(value || fallback).trim();
@@ -105,7 +87,91 @@ export function resolveSource(env) {
     return embedUrl(id);
   };
 
-  return { origin, referer: `${origin}/`, embedPath, tvEmbedPath, embedUrl, embedUrlFor };
+  return {
+    key: 'unlimplay',
+    name: 'UnlimPlay',
+    origin,
+    referer: `${origin}/`,
+    embedPath,
+    tvEmbedPath,
+    embedUrl,
+    embedUrlFor,
+    embedUrlsFor: (type, id, season, episode) => [
+      embedUrlFor(type, id, season, episode),
+    ],
+  };
+}
+
+/** Configuración del proveedor principal Vimeus. La clave no tiene valor por defecto. */
+export function resolveVimeusSource(env) {
+  const origin = normalizeOrigin(env?.VIMEUS_ORIGIN, VIMEUS_DEFAULTS.origin);
+  const referer = String(env?.VIMEUS_REFERER || `${origin}/`).trim();
+  const viewKey = String(env?.VIMEUS_VIEW_KEY || env?.VIEW_KEY || '').trim();
+  const moviePath = String(env?.VIMEUS_MOVIE_PATH || VIMEUS_DEFAULTS.moviePath).trim();
+  const seriesPaths = String(
+    env?.VIMEUS_SERIES_PATHS || VIMEUS_DEFAULTS.seriesPaths.join(','),
+  )
+    .split(',')
+    .map((path) => path.trim())
+    .filter(Boolean);
+
+  const buildEmbedUrl = (type, id, season, episode, path) => {
+    if (!viewKey) return null;
+    const url = new URL(path.startsWith('/') ? path : `/${path}`, `${origin}/`);
+    const mediaId = String(id);
+    url.searchParams.set(/^tt/i.test(mediaId) ? 'imdb' : 'tmdb', mediaId);
+
+    if (type === 'series' || type === 'tv') {
+      if (!Number.isInteger(season) || season < 0 || !Number.isInteger(episode) || episode < 1) {
+        throw new Error('Una serie requiere temporada y episodio válidos');
+      }
+      url.searchParams.set('se', String(season));
+      url.searchParams.set('ep', String(episode));
+    }
+
+    url.searchParams.set('view_key', viewKey);
+    return url.toString();
+  };
+
+  const embedUrlsFor = (type, id, season, episode) => {
+    const paths = type === 'series' || type === 'tv' ? seriesPaths : [moviePath];
+    return paths
+      .map((path) => buildEmbedUrl(type, id, season, episode, path))
+      .filter(Boolean);
+  };
+
+  return {
+    key: 'vimeus',
+    name: 'Vimeus',
+    origin,
+    referer,
+    viewKey,
+    moviePath,
+    seriesPaths,
+    embedUrlsFor,
+  };
+}
+
+/** Orden configurable; por defecto Vimeus primero y UnlimPlay como fallback. */
+export function resolveProviderOrder(env) {
+  const configured = String(env?.PROVIDER_ORDER || DEFAULT_PROVIDER_ORDER.join(','))
+    .split(',')
+    .map((provider) => provider.trim().toLowerCase())
+    .filter((provider) => provider === 'vimeus' || provider === 'unlimplay');
+  const unique = [...new Set(configured)];
+  return unique.length > 0 ? unique : [...DEFAULT_PROVIDER_ORDER];
+}
+
+function resolveProvider(provider, env) {
+  if (provider === 'vimeus') return resolveVimeusSource(env);
+  if (provider === 'unlimplay') return resolveSource(env);
+  return null;
+}
+
+function resolveActiveSource(env) {
+  const order = resolveProviderOrder(env);
+  const configuredProvider = order.find((key) => key !== 'vimeus' || resolveVimeusSource(env).viewKey);
+  return resolveProvider(configuredProvider || order[0] || 'unlimplay', env) || resolveSource(env);
 }
 
 /** Cabeceras que Stremio/ffmpeg deben enviar al pedir el .m3u8 y sus segmentos. */
@@ -143,7 +209,7 @@ const CORS_HEADERS = Object.freeze({
   'Access-Control-Allow-Headers':
     'Content-Type, Authorization, User-Agent, Referer, Origin, Range, Accept, X-Requested-With',
   'Access-Control-Expose-Headers':
-    'Content-Length, Content-Range, X-Proxy-Error, X-Proxy-Detail, X-Source-Id, X-Candidates-Found',
+    'Content-Length, Content-Range, X-Proxy-Error, X-Proxy-Detail, X-Source-Id, X-Candidates-Found, X-Stream-Provider, X-Provider-Attempts',
   'Access-Control-Max-Age': '86400',
 });
 
@@ -243,6 +309,18 @@ function safeHeaderValue(value) {
     .replace(/[^\x20-\x7E\x80-\xFF]/g, '') // fuera de Latin-1 imprimible
     .replace(/[\r\n]/g, ' ') // anti header-injection
     .trim();
+}
+
+/** Evita filtrar claves view_key y tokens en cabeceras de diagnóstico o logs. */
+function redactSecrets(value) {
+  return String(value ?? '').replace(
+    /([?&](?:view_key|api_key|access_token|token|key|signature|sig|auth)=)[^&#\s"'<>]*/gi,
+    '$1[redacted]',
+  );
+}
+
+function safeDiagnostic(value, maxLength = 200) {
+  return safeHeaderValue(redactSecrets(value)).slice(0, maxLength);
 }
 
 /** Respuesta JSON con cabeceras CORS ya aplicadas. */
@@ -772,7 +850,7 @@ async function fetchText(url, headers, timeoutMs = LIMITS.fetchTimeoutMs) {
   });
 
   if (!response.ok) {
-    const error = new Error(`HTTP ${response.status} ${response.statusText} en ${url}`);
+    const error = new Error(`HTTP ${response.status} ${response.statusText} en ${redactSecrets(url)}`);
     error.status = response.status;
     error.url = url;
     throw error;
@@ -792,7 +870,7 @@ async function fetchText(url, headers, timeoutMs = LIMITS.fetchTimeoutMs) {
  * @returns {object} manifest de Stremio
  */
 export function buildManifest(env) {
-  const source = resolveSource(env);
+  const source = resolveActiveSource(env);
   return {
     id: ADDON.id,
     version: ADDON.version,
@@ -816,20 +894,22 @@ export function buildManifest(env) {
  * @param {object} env    variables de entorno
  * @returns {object}
  */
-function buildStream(m3u8Url, index, workerUrl, env) {
-  const source = resolveSource(env);
+function buildStream(m3u8Url, index, workerUrl, env, source) {
   const useProxy = envFlag(env?.PROXY_HLS, false);
   const notWebReady = useProxy ? false : envFlag(env?.NOT_WEB_READY, true);
 
-  // En modo proxy el Worker hace de pasarela HLS e inyecta él las cabeceras,
-  // así el cliente no necesita soportar requestHeaders (Stremio Web incluido).
-  const finalUrl = useProxy
-    ? `${workerUrl.origin}/proxy?url=${encodeURIComponent(m3u8Url)}`
-    : m3u8Url;
+  // En modo proxy se conserva el proveedor para aplicar sus cabeceras a todo el HLS.
+  const proxyUrl = new URL('/proxy', workerUrl.origin);
+  proxyUrl.searchParams.set('url', m3u8Url);
+  proxyUrl.searchParams.set('provider', source.key);
+  const finalUrl = useProxy ? proxyUrl.toString() : m3u8Url;
 
-  // El candidato principal usa el título exigido; los alternativos se etiquetan.
-  const title =
-    index === 0 ? 'UnlimPlay 1080p [HLS Edge]' : `UnlimPlay 1080p [HLS Edge · Alt ${index + 1}]`;
+  const providerLabel = source.key === 'unlimplay'
+    ? 'UnlimPlay [respaldo]'
+    : 'Vimeus';
+  const title = index === 0
+    ? `${providerLabel} [HLS]`
+    : `${providerLabel} [HLS · Alt ${index + 1}]`;
 
   return {
     name: ADDON.name,
@@ -837,16 +917,12 @@ function buildStream(m3u8Url, index, workerUrl, env) {
     type: 'hls',
     url: finalUrl,
     behaviorHints: {
-      // Stremio usa notSupported=false para marcar el stream como reproducible.
       notSupported: false,
-      // Evita que se muestre en Stremio Web cuando depende de cabeceras propias.
       notWebReady,
-      // Cabeceras que el reproductor debe enviar al pedir el HLS.
       requestHeaders: {
         Referer: source.referer,
         'User-Agent': BROWSER_UA,
       },
-      // Formato moderno equivalente (Stremio >= 1.6 usa proxyHeaders).
       proxyHeaders: {
         request: {
           Referer: source.referer,
@@ -854,8 +930,7 @@ function buildStream(m3u8Url, index, workerUrl, env) {
           Origin: source.origin,
         },
       },
-      // Agrupa las variantes del mismo origen en la UI de Stremio.
-      bingeGroup: `unlimplay-${index}`,
+      bingeGroup: `${source.key}-${index}`,
     },
   };
 }
@@ -914,105 +989,211 @@ function responsePlaylistUrl(result, requestedUrl) {
  * @param {object} env
  * @returns {Promise<Response>}
  */
+async function resolveProviderUrls(source, kind, coordinates, workerUrl, env, maxStreams) {
+  const embedUrls = source.embedUrlsFor(
+    kind,
+    coordinates.id,
+    coordinates.season,
+    coordinates.episode,
+  );
+  let lastError = null;
+  let deepScanBudget = LIMITS.maxDeepScanRequests;
+
+  for (const embedUrl of embedUrls) {
+    try {
+      const firstPage = await fetchText(embedUrl, scrapeHeaders(source));
+      const firstPageUrl = firstPage.response.url || embedUrl;
+      let urls = extractM3u8Urls(firstPage.body, firstPageUrl, { max: maxStreams * 4 });
+      if (urls.length === 0) {
+        const directPlaylist = responsePlaylistUrl(firstPage, firstPageUrl);
+        if (directPlaylist) urls = [directPlaylist];
+      }
+
+      let scanError = null;
+      if (urls.length === 0 && deepScanBudget > 0 && envFlag(env?.DEEP_SCAN, true)) {
+        const isWorkerUrl = (target) => {
+          try {
+            return new URL(target).origin === workerUrl.origin;
+          } catch {
+            return true;
+          }
+        };
+        const queue = findConfigUrls(firstPage.body, firstPageUrl)
+          .filter((target) => !isWorkerUrl(target))
+          .map((url) => ({ url, referer: firstPageUrl }));
+        const visited = new Set([embedUrl, firstPageUrl]);
+        const queued = new Set(queue.map((item) => item.url));
+
+        while (queue.length > 0 && deepScanBudget > 0 && urls.length === 0) {
+          const next = queue.shift();
+          if (!next || visited.has(next.url)) continue;
+          visited.add(next.url);
+          deepScanBudget--;
+
+          try {
+            const page = await fetchText(next.url, scrapeHeaders(source, next.referer));
+            const pageUrl = page.response.url || next.url;
+            urls = extractM3u8Urls(page.body, pageUrl, { max: maxStreams * 4 });
+            if (urls.length === 0) {
+              const directPlaylist = responsePlaylistUrl(page, pageUrl);
+              if (directPlaylist) urls = [directPlaylist];
+            }
+
+            if (urls.length === 0 && deepScanBudget > 0) {
+              for (const relatedUrl of findConfigUrls(page.body, pageUrl)) {
+                if (isWorkerUrl(relatedUrl) || visited.has(relatedUrl) || queued.has(relatedUrl)) continue;
+                queued.add(relatedUrl);
+                queue.push({ url: relatedUrl, referer: pageUrl });
+              }
+            }
+          } catch (err) {
+            scanError = err;
+            lastError = err;
+            console.warn(
+              `[${source.key}] deep-scan failed for id=${coordinates.id}: ${safeDiagnostic(err?.message)}`,
+            );
+          }
+        }
+      }
+
+      if (scanError) lastError = scanError;
+      if (urls.length > 0) {
+        const checked = await verifyHlsCandidates(source, urls, maxStreams, env);
+        if (checked.urls.length > 0) return { urls: checked.urls, error: null };
+        if (checked.error) lastError = checked.error;
+      }
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  return { urls: [], error: lastError };
+}
+
+/** Pide la playlist con las cabeceras del proveedor para detectar HLS caducado. */
+async function verifyHlsCandidates(source, urls, maxStreams, env) {
+  if (!envFlag(env?.VERIFY_HLS, true)) return { urls, error: null };
+
+  const verified = [];
+  let lastError = null;
+  for (const candidate of urls.slice(0, maxStreams)) {
+    let parsed;
+    try {
+      parsed = new URL(candidate);
+    } catch {
+      lastError = new Error('invalid-hls-url');
+      lastError.code = 'invalid-hls-url';
+      continue;
+    }
+
+    if (!isSafeScanTarget(parsed, `${source.origin}/`)) {
+      lastError = new Error('unsafe-hls-url');
+      lastError.code = 'unsafe-hls-url';
+      continue;
+    }
+
+    try {
+      const result = await fetchText(candidate, {
+        ...playbackHeaders(source),
+        Accept: 'application/vnd.apple.mpegurl, application/x-mpegURL, */*;q=0.8',
+      });
+      const body = result.body.replace(/^\uFEFF/, '').trimStart();
+      if (!body.startsWith('#EXTM3U')) {
+        const error = new Error('La URL extraída no devolvió una playlist HLS válida');
+        error.code = 'invalid-hls';
+        lastError = error;
+        continue;
+      }
+
+      const finalUrl = absolutize(result.response.url || candidate, candidate);
+      if (finalUrl) verified.push(finalUrl);
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  return { urls: verified, error: verified.length > 0 ? null : lastError };
+}
+
+/**
+ * Resuelve un stream siguiendo el orden de proveedores configurado.
+ * Vimeus es el principal por defecto; UnlimPlay sólo se consulta si Vimeus no
+ * entrega un HLS reproducible (o si falta su view_key).
+ */
 async function handleStream(rawId, type, request, env) {
   const kind = type === 'tv' ? 'series' : type;
   const coordinates = parseStreamRequest(rawId, kind);
+  if (!coordinates.id) {
+    return jsonResponse({ streams: [] }, 200, { 'X-Proxy-Error': 'bad-id' });
+  }
 
-  // Id/episodio inválido → respuesta vacía válida para Stremio.
-  if (!coordinates.id) return jsonResponse({ streams: [] }, 200, { 'X-Proxy-Error': 'bad-id' });
-
-  const source = resolveSource(env);
-  const embedUrl = source.embedUrlFor(kind, coordinates.id, coordinates.season, coordinates.episode);
   const workerUrl = new URL(request.url);
   const maxStreams = envInt(env?.MAX_STREAMS, LIMITS.defaultMaxStreams);
+  const attempts = [];
+  const errors = [];
 
-  try {
-    // 1) Petición al embed: sólo se usan solicitudes HTTP normales. No se
-    //    ejecuta JavaScript ni se inventan tokens/cookies si el origen los exige.
-    const firstPage = await fetchText(embedUrl, scrapeHeaders(source));
-    const firstPageUrl = firstPage.response.url || embedUrl;
-    let urls = extractM3u8Urls(firstPage.body, firstPageUrl, { max: maxStreams * 4 });
-    if (urls.length === 0) {
-      const directPlaylist = responsePlaylistUrl(firstPage, firstPageUrl);
-      if (directPlaylist) urls = [directPlaylist];
+  for (const providerKey of resolveProviderOrder(env)) {
+    const source = resolveProvider(providerKey, env);
+    if (!source) continue;
+
+    if (source.key === 'vimeus' && !source.viewKey) {
+      attempts.push('vimeus:missing-view-key');
+      continue;
     }
 
-    // 2) El reproductor real puede vivir en un iframe, un script de player o
-    //    una API JSON anidada. Seguimos sólo un máximo acotado de referencias.
-    let scanError = null;
-    if (urls.length === 0 && envFlag(env?.DEEP_SCAN, true)) {
-      const isWorkerUrl = (target) => {
-        try {
-          return new URL(target).origin === workerUrl.origin;
-        } catch {
-          return true;
-        }
-      };
-      const queue = findConfigUrls(firstPage.body, firstPageUrl)
-        .filter((target) => !isWorkerUrl(target))
-        .map((url) => ({ url, referer: firstPageUrl }));
-      const visited = new Set([embedUrl, firstPageUrl]);
-      const queued = new Set(queue.map((item) => item.url));
-      let requests = 0;
+    let result = await resolveProviderUrls(
+      source,
+      kind,
+      coordinates,
+      workerUrl,
+      env,
+      maxStreams,
+    );
 
-      while (queue.length > 0 && requests < LIMITS.maxDeepScanRequests && urls.length === 0) {
-        const next = queue.shift();
-        if (!next || visited.has(next.url)) continue;
-        visited.add(next.url);
-        requests++;
+    if (result.urls.length > 0) {
+      attempts.push(`${source.key}:hls`);
+      const streams = result.urls
+        .slice(0, maxStreams)
+        .map((url, index) => buildStream(url, index, workerUrl, env, source));
 
-        try {
-          const page = await fetchText(next.url, scrapeHeaders(source, next.referer));
-          const pageUrl = page.response.url || next.url;
-          urls = extractM3u8Urls(page.body, pageUrl, { max: maxStreams * 4 });
-          if (urls.length === 0) {
-            const directPlaylist = responsePlaylistUrl(page, pageUrl);
-            if (directPlaylist) urls = [directPlaylist];
-          }
-
-          if (urls.length === 0) {
-            for (const relatedUrl of findConfigUrls(page.body, pageUrl)) {
-              if (isWorkerUrl(relatedUrl) || visited.has(relatedUrl) || queued.has(relatedUrl)) continue;
-              queued.add(relatedUrl);
-              queue.push({ url: relatedUrl, referer: pageUrl });
-            }
-          }
-        } catch (innerErr) {
-          scanError = innerErr;
-          console.warn(`[unlimplay] deep-scan falló en ${next.url}: ${innerErr?.message}`);
-        }
-      }
+      return jsonResponse({ streams }, 200, {
+        'X-Source-Id': coordinates.id,
+        'X-Candidates-Found': String(result.urls.length),
+        'X-Stream-Provider': source.key,
+        'X-Provider-Attempts': attempts.join(','),
+      });
     }
 
-    // 3) Sin candidatos: diferenciamos un origen que bloquea/cae de una página
-    //    válida que sencillamente no publica HLS.
-    if (urls.length === 0) {
-      console.warn(`[unlimplay] sin .m3u8 para id=${coordinates.id} (${embedUrl})`);
-      return jsonResponse({ streams: [] }, 200, scanError
-        ? {
-            'X-Proxy-Error': 'upstream',
-            'X-Proxy-Detail': String(scanError?.message ?? 'deep-scan-failed').slice(0, 200),
-          }
-        : { 'X-Proxy-Error': 'not-found' });
+    if (result.error) {
+      errors.push(result.error);
+      const status = Number(result.error.status);
+      const reason = status ? `http-${status}` : result.error.code || 'upstream-error';
+      attempts.push(`${source.key}:${reason}`);
+    } else {
+      attempts.push(`${source.key}:no-hls`);
     }
-
-    // 4) Respuesta Stremio.
-    const streams = urls
-      .slice(0, maxStreams)
-      .map((url, index) => buildStream(url, index, workerUrl, env));
-
-    return jsonResponse({ streams }, 200, {
-      'X-Source-Id': coordinates.id,
-      'X-Candidates-Found': String(urls.length),
-    });
-  } catch (err) {
-    // Cualquier excepción de red/parseo se degrada a streams vacío.
-    console.error(`[unlimplay] error resolviendo id=${coordinates.id}: ${err?.message ?? err}`);
-    return jsonResponse({ streams: [] }, 200, {
-      'X-Proxy-Error': 'upstream',
-      'X-Proxy-Detail': String(err?.message ?? 'unknown').slice(0, 200),
-    });
   }
+
+  const missingViewKey = attempts.includes('vimeus:missing-view-key');
+  const finalError = errors.at(-1);
+  const errorCode = finalError
+    ? 'upstream'
+    : missingViewKey
+      ? 'missing-view-key'
+      : 'not-found';
+  const detail = finalError
+    ? safeDiagnostic(finalError.message)
+    : safeDiagnostic(attempts.join('; '));
+
+  console.warn(
+    `[addon] sin HLS para id=${coordinates.id}; intentos=${attempts.join(',') || 'none'}`,
+  );
+  return jsonResponse({ streams: [] }, 200, {
+    'X-Proxy-Error': errorCode,
+    'X-Proxy-Detail': detail,
+    'X-Source-Id': coordinates.id,
+    'X-Provider-Attempts': attempts.join(','),
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1028,10 +1209,13 @@ async function handleStream(rawId, type, request, env) {
  * @param {string} workerOrigin origen del Worker, p.ej. https://x.workers.dev
  * @returns {string}
  */
-export function rewritePlaylist(text, playlistUrl, workerOrigin) {
+export function rewritePlaylist(text, playlistUrl, workerOrigin, provider = 'unlimplay') {
+  const providerKey = provider === 'vimeus' ? 'vimeus' : 'unlimplay';
   const proxify = (childUrl) => {
     const abs = absolutize(childUrl, playlistUrl);
-    return abs ? `${workerOrigin}/proxy?url=${encodeURIComponent(abs)}` : null;
+    return abs
+      ? `${workerOrigin}/proxy?url=${encodeURIComponent(abs)}&provider=${providerKey}`
+      : null;
   };
 
   return String(text)
@@ -1082,8 +1266,16 @@ async function handleProxy(url, request, env) {
   // SSRF básico: no permitimos que el proxy apunte al propio Worker.
   if (abs.origin === url.origin) return jsonResponse({ error: 'Bucle de proxy no permitido' }, 400);
 
+  const requestedProvider = url.searchParams.get('provider');
+  if (requestedProvider && !['vimeus', 'unlimplay'].includes(requestedProvider)) {
+    return jsonResponse({ error: 'Proveedor inválido' }, 400);
+  }
+  const source = requestedProvider
+    ? resolveProvider(requestedProvider, env)
+    : resolveActiveSource(env);
+
   try {
-    const headers = { ...playbackHeaders(resolveSource(env)), Accept: '*/*' };
+    const headers = { ...playbackHeaders(source), Accept: '*/*' };
     const range = request.headers.get('Range');
     if (range) headers.Range = range;
 
@@ -1115,7 +1307,7 @@ async function handleProxy(url, request, env) {
 
     const text = await upstream.text();
     const body = text.trimStart().startsWith('#EXTM3U')
-      ? rewritePlaylist(text, abs.toString(), url.origin)
+      ? rewritePlaylist(text, abs.toString(), url.origin, source.key)
       : text;
 
     return new Response(body, {
@@ -1127,7 +1319,7 @@ async function handleProxy(url, request, env) {
       },
     });
   } catch (err) {
-    console.error(`[unlimplay] proxy falló en ${abs}: ${err?.message ?? err}`);
+    console.error(`[${source.key}] proxy falló en ${safeDiagnostic(abs.toString())}: ${safeDiagnostic(err?.message)}`);
     return jsonResponse({ error: 'No se pudo obtener el recurso' }, 502, {
       'X-Proxy-Error': 'proxy-fetch',
     });
@@ -1186,8 +1378,11 @@ export function healthHtml(info) {
   <div class="card">
     <dl class="kv">
       <dt>Instalar en Stremio</dt><dd><code id="install">${info.install}</code></dd>
-      <dt>Origen de vídeo</dt><dd><code>${info.source}</code></dd>
-      <dt>Manifiesto</dt><dd><a href="/manifest.json">/manifest.json</a></dd>
+          <dt>Proveedor activo</dt><dd><code>${info.activeProvider}</code></dd>
+          <dt>Orden de respaldo</dt><dd><code>${info.providerOrder}</code></dd>
+          <dt>Vimeus view_key</dt><dd><code>${info.vimeusConfigured ? 'configurada' : 'no configurada; se usará UnlimPlay'}</code></dd>
+          <dt>Origen activo</dt><dd><code>${info.source}</code></dd>
+          <dt>Manifiesto</dt><dd><a href="/manifest.json">/manifest.json</a></dd>
     </dl>
     <div class="row" style="margin-top:1rem">
       <button onclick="navigator.clipboard.writeText(document.getElementById('install').textContent)">
@@ -1293,12 +1488,17 @@ export default {
     try {
       // --- Raíz: healthcheck / consola de pruebas -------------------------
       if (path === '/' || path === '/index.json') {
+        const providerOrder = resolveProviderOrder(env);
+        const activeSource = resolveActiveSource(env);
         const payload = {
           status: 'ok',
           addon: ADDON.name,
           id: ADDON.id,
           version: ADDON.version,
-          source: resolveSource(env).origin,
+          source: activeSource.origin,
+          activeProvider: activeSource.key,
+          providerOrder: providerOrder.join(','),
+          vimeusConfigured: Boolean(resolveVimeusSource(env).viewKey),
           endpoints: [
             '/manifest.json',
             '/stream/movie/{id}.json',
@@ -1349,7 +1549,7 @@ export default {
       );
     } catch (err) {
       // Red de seguridad global: el Worker nunca debe devolver un stack trace.
-      console.error(`[unlimplay] error no controlado en ${path}: ${err?.message ?? err}`);
+      console.error(`[addon] error no controlado en ${path}: ${safeDiagnostic(err?.message)}`);
       if (path.startsWith('/stream')) return jsonResponse({ streams: [] }, 200);
       return jsonResponse({ error: 'Internal Server Error' }, 500);
     }
