@@ -1,9 +1,9 @@
 {
-  "name": "vimeus-unlimplay-proxy-stream",
-  "version": "1.2.0",
+  "name": "vimeus-proxy-stream",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
-  "description": "Addon proxy de Stremio (Cloudflare Worker) que resuelve HLS desde Vimeus con fallback a UnlimPlay.",
+  "description": "Addon proxy de Stremio (Cloudflare Worker) que resuelve HLS desde Vimeus.",
   "main": "src/index.js",
   "scripts": {
     "test": "node --test test/*.test.mjs",
@@ -11,8 +11,7 @@
     "deploy": "wrangler deploy",
     "tail": "wrangler tail",
     "mock": "node tools/mock-origin.mjs",
-    "dev:local": "wrangler dev --ip 0.0.0.0 --port 8787 --var SOURCE_ORIGIN:http://127.0.0.1:8788",
-    "dev:vimeus:local": "wrangler dev --ip 0.0.0.0 --port 8787 --var VIMEUS_ORIGIN:http://127.0.0.1:8788 --var VIMEUS_VIEW_KEY:local-test-key --var VIMEUS_REFERER:http://127.0.0.1:8788/ --var UNLIMPLAY_ORIGIN:http://127.0.0.1:8788"
+    "dev:local": "wrangler dev --ip 0.0.0.0 --port 8787 --var VIMEUS_ORIGIN:http://127.0.0.1:8788 --var VIMEUS_VIEW_KEY:local-test-key --var VIMEUS_REFERER:http://127.0.0.1:8788/ --var VIMEUS_API_KEY:local-api-key"
   },
   "keywords": [
     "stremio",

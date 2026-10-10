@@ -13,11 +13,16 @@ import {
   findConfigUrls,
   rewritePlaylist,
   buildManifest,
-  resolveProviderOrder,
   resolveVimeusSource,
+  resolveSource,
+  unpackPackedJs,
+  isHlsUrl,
+  describePlaylist,
+  listingItemToMeta,
+  listingPageFromSkip,
 } from '../src/index.js';
 
-const BASE = 'https://unlimplay.com/f/embed/movie/tt1234567';
+const BASE = 'https://vimeus.com/e/movie?imdb=tt1234567&view_key=test-key';
 
 // ---------------------------------------------------------------------------
 // cleanId
@@ -72,7 +77,7 @@ test('normalizeSource: une concatenaciones JS en la variante flat', () => {
 // ---------------------------------------------------------------------------
 test('absolutize: resuelve relativas y protocol-relative', () => {
   assert.equal(absolutize('//cdn.example.com/a.m3u8', BASE), 'https://cdn.example.com/a.m3u8');
-  assert.equal(absolutize('/hls/a.m3u8', BASE), 'https://unlimplay.com/hls/a.m3u8');
+  assert.equal(absolutize('/hls/a.m3u8', BASE), 'https://vimeus.com/hls/a.m3u8');
   assert.equal(
     absolutize('a.m3u8', 'https://cdn.example.com/hls/index.html'),
     'https://cdn.example.com/hls/a.m3u8',
@@ -89,13 +94,13 @@ const FIXTURES = {
   jwplayer: `
     <script>
       jwplayer("player").setup({
-        sources: [{ file: "https:\\/\\/cdn.unlimplay.com\\/hls\\/tt1234567\\/master.m3u8?token=abc123",
+        sources: [{ file: "https:\\/\\/cdn.vimeus.test\\/hls\\/tt1234567\\/master.m3u8?token=abc123",
                     type: "application/x-mpegURL" }],
         image: "/poster.jpg"
       });
     </script>`,
 
-  plyr: `<div id="player" data-source='{"sources":[{"src":"//cdn2.unlimplay.video/v/abc/index.m3u8","type":"application/x-mpegURL"}]}'></div>`,
+  plyr: `<div id="player" data-source='{"sources":[{"src":"//cdn2.vimeus.test/v/abc/index.m3u8","type":"application/x-mpegURL"}]}'></div>`,
 
   videojs: `<script>player.src({ src: "https://cdn3.example.net/stream/tt1234567/playlist.m3u8", type: "application/x-mpegURL" });</script>`,
 
@@ -120,12 +125,12 @@ const FIXTURES = {
 test('extract: JWPlayer con file escapado (\\/)', () => {
   const urls = extractM3u8Urls(FIXTURES.jwplayer, BASE);
   assert.equal(urls.length, 1);
-  assert.equal(urls[0], 'https://cdn.unlimplay.com/hls/tt1234567/master.m3u8?token=abc123');
+  assert.equal(urls[0], 'https://cdn.vimeus.test/hls/tt1234567/master.m3u8?token=abc123');
 });
 
 test('extract: Plyr con URL protocol-relative', () => {
   const urls = extractM3u8Urls(FIXTURES.plyr, BASE);
-  assert.deepEqual(urls, ['https://cdn2.unlimplay.video/v/abc/index.m3u8']);
+  assert.deepEqual(urls, ['https://cdn2.vimeus.test/v/abc/index.m3u8']);
 });
 
 test('extract: Video.js con src entre comillas', () => {
@@ -192,7 +197,7 @@ test('extract: URL Base64 y doble percent-encoding', () => {
 test('extract: source con ruta HLS relativa explícita', () => {
   assert.deepEqual(
     extractM3u8Urls('<video><source src="/hls/master.m3u8?token=x"></video>', BASE),
-    ['https://unlimplay.com/hls/master.m3u8?token=x'],
+    ['https://vimeus.com/hls/master.m3u8?token=x'],
   );
 });
 
@@ -244,9 +249,9 @@ test('findConfigUrls: detecta endpoints de API y descarta estáticos', () => {
     <script>fetch("/api/source/tt1234567").then(...)</script>
     <script>var cfg = "https://api.example.net/player/config.php?id=tt1234567";</script>`;
   const urls = findConfigUrls(html, BASE);
-  assert.ok(urls.includes('https://unlimplay.com/api/source/tt1234567'));
+  assert.ok(urls.includes('https://vimeus.com/api/source/tt1234567'));
   assert.ok(urls.includes('https://api.example.net/player/config.php?id=tt1234567'));
-  assert.ok(urls.includes('https://unlimplay.com/assets/player.js'));
+  assert.ok(urls.includes('https://vimeus.com/assets/player.js'));
   assert.ok(!urls.some((u) => u.endsWith('logo.png')));
 });
 
@@ -284,13 +289,21 @@ test('rewritePlaylist: proxifica variantes, segmentos y claves', () => {
 
   assert.ok(out.startsWith('#EXTM3U'));
   assert.ok(
-    out.includes('URI="https://w.dev/proxy?url=https%3A%2F%2Fcdn.example.net%2Fhls%2Ftt1%2Fkey.php%3Fk%3D1&provider=unlimplay"'),
+    out.includes('URI="https://w.dev/proxy?url=https%3A%2F%2Fcdn.example.net%2Fhls%2Ftt1%2Fkey.php%3Fk%3D1"'),
   );
   assert.ok(out.includes('https://w.dev/proxy?url=https%3A%2F%2Fcdn.example.net%2Fhls%2Ftt1%2Fseg0.ts'));
   assert.ok(out.includes('https://w.dev/proxy?url=https%3A%2F%2Fcdn.example.net%2Fhls%2Ftt1%2Fseg1.ts'));
   assert.ok(out.includes('https://w.dev/proxy?url=https%3A%2F%2Fcdn.example.net%2Fhls%2Ftt1%2Fseg2.ts'));
   assert.ok(out.includes('#EXT-X-ENDLIST'));
   assert.ok(out.includes('#EXTINF:6.0,'));
+  assert.ok(!out.includes('provider='), 'ya no se añade el parámetro provider');
+});
+
+test('rewritePlaylist: propaga ref= a variantes, segmentos y claves', () => {
+  const playlist = ['#EXTM3U', '#EXT-X-KEY:METHOD=AES-128,URI="key.php"', '#EXTINF:6.0,', 'seg0.ts'].join('\n');
+  const out = rewritePlaylist(playlist, 'https://cdn.example.net/hls/index.m3u8', 'https://w.dev', 'https://host.example');
+  assert.ok(out.includes('URI="https://w.dev/proxy?url=https%3A%2F%2Fcdn.example.net%2Fhls%2Fkey.php&ref=https%3A%2F%2Fhost.example"'));
+  assert.ok(out.includes('https://w.dev/proxy?url=https%3A%2F%2Fcdn.example.net%2Fhls%2Fseg0.ts&ref=https%3A%2F%2Fhost.example'));
 });
 
 test('rewritePlaylist: master con variantes absolutas', () => {
@@ -305,7 +318,8 @@ test('rewritePlaylist: master con variantes absolutas', () => {
 test('buildManifest: cumple el contrato de Stremio', () => {
   const m = buildManifest();
   assert.equal(m.id, 'com.cf.unlimplay.proxy');
-  assert.equal(m.name, 'Vimeus + UnlimPlay HLS');
+  assert.equal(m.name, 'Vimeus HLS');
+  assert.equal(m.logo, 'https://vimeus.com/favicon.ico');
   assert.deepEqual(m.resources, ['stream']);
   assert.deepEqual(m.types, ['movie', 'series']);
   assert.deepEqual(m.idPrefixes, ['tt', 'tmdb:']);
@@ -313,7 +327,7 @@ test('buildManifest: cumple el contrato de Stremio', () => {
 });
 
 test('extract: el patrón D no inventa URLs con bases que son sólo la raíz', () => {
-  const html = '<script>var h = "https://unlimplay.com/"; var f = "master.m3u8";</script>';
+  const html = '<script>var h = "https://vimeus.com/"; var f = "master.m3u8";</script>';
   assert.deepEqual(extractM3u8Urls(html, BASE), []);
 });
 
@@ -342,14 +356,6 @@ test('truncateSmart: no modifica documentos pequeños', async () => {
 // ---------------------------------------------------------------------------
 // Proveedores
 // ---------------------------------------------------------------------------
-test('resolveProviderOrder: Vimeus es principal y UnlimPlay fallback', () => {
-  assert.deepEqual(resolveProviderOrder({}), ['vimeus', 'unlimplay']);
-  assert.deepEqual(resolveProviderOrder({ PROVIDER_ORDER: 'unlimplay,vimeus,vimeus,other' }), [
-    'unlimplay',
-    'vimeus',
-  ]);
-});
-
 test('resolveVimeusSource: construye embeds IMDb/TMDb con view_key', () => {
   const source = resolveVimeusSource({ VIMEUS_VIEW_KEY: 'test-key' });
   assert.equal(source.origin, 'https://vimeus.com');
@@ -375,29 +381,196 @@ test('resolveVimeusSource: sin clave no crea una URL de embed', () => {
   assert.deepEqual(source.embedUrlsFor('movie', 'tt123'), []);
 });
 
-// ---------------------------------------------------------------------------
-// resolveSource (origen configurable por env)
-// ---------------------------------------------------------------------------
-test('resolveSource: valores por defecto exigidos por el addon', async () => {
-  const { resolveSource } = await import('../src/index.js');
-  const s = resolveSource({});
-  assert.equal(s.origin, 'https://unlimplay.com');
-  assert.equal(s.referer, 'https://unlimplay.com/');
-  assert.equal(s.embedUrl('tt1234567'), 'https://unlimplay.com/f/embed/movie/tt1234567');
-  assert.equal(s.tvEmbedPath, '/f/embed/tv/');
-  assert.equal(s.embedUrlFor('series', 'tt0903747', 1, 2), 'https://unlimplay.com/f/embed/tv/tt0903747/1/2');
+test('resolveVimeusSource: valores por defecto y alias resolveSource', () => {
+  const source = resolveVimeusSource({});
+  assert.equal(source.key, 'vimeus');
+  assert.equal(source.name, 'Vimeus');
+  assert.equal(source.origin, 'https://vimeus.com');
+  assert.equal(source.referer, 'https://vimeus.com/');
+  assert.equal(source.moviePath, '/e/movie');
+  assert.deepEqual(source.seriesPaths, ['/e/serie', '/e/anime']);
+  assert.equal(resolveSource, resolveVimeusSource);
 });
 
-test('resolveSource: sobrescribible por variables de entorno', async () => {
-  const { resolveSource } = await import('../src/index.js');
-  const s = resolveSource({
-    SOURCE_ORIGIN: 'https://mirror.example.org/',
-    EMBED_PATH: 'embed/movie',
-    TV_EMBED_PATH: 'embed/tv',
+test('resolveVimeusSource: sobrescribible por variables de entorno', () => {
+  const source = resolveVimeusSource({
+    VIMEUS_ORIGIN: 'https://mirror.example.org/',
+    VIMEUS_REFERER: 'https://allowed.example/',
+    VIMEUS_MOVIE_PATH: 'embed/film',
+    VIMEUS_SERIES_PATHS: '/embed/show, /embed/anime',
+    VIEW_KEY: 'legacy',
   });
-  assert.equal(s.origin, 'https://mirror.example.org');
-  assert.equal(s.referer, 'https://mirror.example.org/');
-  assert.equal(s.embedUrl('tt1'), 'https://mirror.example.org/embed/movie/tt1');
-  assert.equal(s.embedUrl('a b'), 'https://mirror.example.org/embed/movie/a%20b');
-  assert.equal(s.embedUrlFor('series', 'tt1', 2, 4), 'https://mirror.example.org/embed/tv/tt1/2/4');
+  assert.equal(source.origin, 'https://mirror.example.org');
+  assert.equal(source.referer, 'https://allowed.example/');
+  assert.equal(source.viewKey, 'legacy');
+
+  const movie = new URL(source.embedUrlsFor('movie', 'a b')[0]);
+  assert.equal(movie.origin, 'https://mirror.example.org');
+  assert.equal(movie.pathname, '/embed/film');
+  assert.equal(movie.searchParams.get('tmdb'), 'a b');
+
+  const series = source.embedUrlsFor('series', 'tt1', 2, 4).map((value) => new URL(value));
+  assert.deepEqual(series.map((url) => url.pathname), ['/embed/show', '/embed/anime']);
+  assert.throws(() => source.embedUrlsFor('series', 'tt1', 1, 0), /temporada y episodio/);
+});
+
+// ---------------------------------------------------------------------------
+// Extractor: ofuscaciones y HLS sin extensión
+// ---------------------------------------------------------------------------
+
+/** Empaquetador p.a.c.k.e.r fiel al original (sólo para generar fixtures). */
+function packJs(src, radix = 62) {
+  const enc = (c) =>
+    (c < radix ? '' : enc(Math.floor(c / radix))) +
+    ((c = c % radix) > 35 ? String.fromCharCode(c + 29) : c.toString(36));
+  const words = [...new Set(src.match(/\b\w+\b/g))];
+  const payload = src.replace(/\b\w+\b/g, (w) => enc(words.indexOf(w)));
+  const keywords = words.map((w, i) => (enc(i) === w ? '' : w));
+  const esc = (v) => v.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+  return (
+    "eval(function(p,a,c,k,e,d){e=function(c){return(c<a?'':e(parseInt(c/a)))+((c=c%a)>35?String.fromCharCode(c+29):c.toString(36))};" +
+    "if(!''.replace(/^/,String)){while(c--){d[e(c)]=k[c]||e(c)}k=[function(e){return d[e]}];e=function(){return'\\\\w+'};c=1};" +
+    "while(c--){if(k[c]){p=p.replace(new RegExp('\\\\b'+e(c)+'\\\\b','g'),k[c])}}return p}" +
+    `('${esc(payload)}',${radix},${keywords.length},'${esc(keywords.join('|'))}'.split('|'),0,{}))`
+  );
+}
+
+const PACKED_SOURCE =
+  'var player=jwplayer("vplayer");player.setup({sources:[{file:"https://cdn-packed.example.net/hls/abc123/master.m3u8?token=p4ck3d",type:"hls"}],image:"/poster.jpg"});';
+
+test('unpackPackedJs: desempaqueta p.a.c.k.e.r en base 62 y 36', () => {
+  for (const radix of [62, 36]) {
+    const unpacked = unpackPackedJs(`<script>${packJs(PACKED_SOURCE, radix)}</script>`);
+    assert.ok(unpacked.includes('cdn-packed.example.net/hls/abc123/master.m3u8?token=p4ck3d'), `radix ${radix}`);
+  }
+  assert.equal(unpackPackedJs('<script>var a = 1;</script>'), '');
+});
+
+test('unpackPackedJs: resuelve bloques anidados', () => {
+  const inner = packJs(PACKED_SOURCE);
+  const outer = packJs(`document.write('${inner.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}');`);
+  assert.ok(unpackPackedJs(outer).includes('cdn-packed.example.net/hls/abc123/master.m3u8'));
+});
+
+test('extract: encuentra el .m3u8 dentro de un script empaquetado', () => {
+  const html = `<html><body><div id="vplayer"></div><script>${packJs(PACKED_SOURCE)}</script></body></html>`;
+  assert.deepEqual(extractM3u8Urls(html, BASE), [
+    'https://cdn-packed.example.net/hls/abc123/master.m3u8?token=p4ck3d',
+  ]);
+});
+
+test('extract: URL escrita al revés (split/reverse/join)', () => {
+  const reversed = [...'https://cdn-rev.example.net/live/index.m3u8?sig=1'].reverse().join('');
+  const html = `<script>var s="${reversed}".split("").reverse().join("");hls.loadSource(s);</script>`;
+  assert.deepEqual(extractM3u8Urls(html, BASE), ['https://cdn-rev.example.net/live/index.m3u8?sig=1']);
+});
+
+test('extract: fuente HLS sin extensión identificada por type', () => {
+  const js = `<script>p.setup({sources:[
+    {src:"https://cdn-typed.example.net/vod/12345/stream",type:"application/x-mpegURL"},
+    {src:"https://cdn-typed.example.net/vod/12345.mp4",type:"video/mp4"}
+  ]})</script>`;
+  assert.deepEqual(extractM3u8Urls(js, BASE), ['https://cdn-typed.example.net/vod/12345/stream']);
+
+  const html = '<video><source type="application/vnd.apple.mpegurl" src="/hls/live/manifest"></video>';
+  assert.deepEqual(extractM3u8Urls(html, BASE), ['https://vimeus.com/hls/live/manifest']);
+
+  const typeFirst = '<script>var cfg={type:"hls",file:"https://cdn-typed.example.net/x/playlist"}</script>';
+  assert.deepEqual(extractM3u8Urls(typeFirst, BASE), ['https://cdn-typed.example.net/x/playlist']);
+});
+
+test('extract: HLS seleccionado por query o formato Azure', () => {
+  const html = `<script>
+    var a="https://cdn-q.example.net/manifest?format=m3u8";
+    var b="https://ams.example.net/x/manifest(format=m3u8-aapl)";
+    var c="https://cdn-q.example.net/manifest?format=mp4";
+    var d="https://cdn-q.example.net/p?type=hls";
+  </script>`;
+  const urls = extractM3u8Urls(html, BASE);
+  assert.ok(urls.includes('https://cdn-q.example.net/manifest?format=m3u8'));
+  assert.ok(urls.includes('https://ams.example.net/x/manifest(format=m3u8-aapl)'));
+  assert.ok(urls.includes('https://cdn-q.example.net/p?type=hls'));
+  assert.ok(!urls.some((u) => u.includes('format=mp4')));
+});
+
+test('extract: trailers/previews quedan por detrás de la película', () => {
+  const html = `<script>
+    a({file:"https://cdn.example.net/preview/trailer.m3u8"});
+    b({file:"https://cdn.example.net/movie/master.m3u8"});
+  </script>`;
+  assert.deepEqual(extractM3u8Urls(html, BASE), [
+    'https://cdn.example.net/movie/master.m3u8',
+    'https://cdn.example.net/preview/trailer.m3u8',
+  ]);
+});
+
+test('isHlsUrl: extensiones, rutas intermedias, query y envoltorios', () => {
+  assert.equal(isHlsUrl('https://a.b/x.m3u8'), true);
+  assert.equal(isHlsUrl('https://a.b/x.M3U8?t=1'), true);
+  assert.equal(isHlsUrl('https://a.b/x.m3u'), true);
+  assert.equal(isHlsUrl('https://a.b/x.m3u8/segment'), true);
+  assert.equal(isHlsUrl('https://a.b/manifest(format=m3u8-aapl)'), true);
+  assert.equal(isHlsUrl('https://a.b/p?type=hls'), true);
+  assert.equal(isHlsUrl('https://a.b/p?file=master.m3u8'), true);
+  assert.equal(isHlsUrl('https://a.b/p?type=hlsx'), false);
+  assert.equal(isHlsUrl('https://a.b/player?source=https://c.d/x.m3u8'), false, 'envoltorio de otra URL');
+  assert.equal(isHlsUrl('https://a.b/player?src=https%3A%2F%2Fc.d%2Fx.m3u8'), false);
+  assert.equal(isHlsUrl('https://a.b/video.mp4'), false);
+  assert.equal(isHlsUrl('ftp://a.b/video.m3u8'), false);
+});
+
+test('absolutize: conserva un ")" que cierra un "(" de la URL', () => {
+  assert.equal(absolutize('https://a.b/x/manifest(format=m3u8-aapl)', BASE), 'https://a.b/x/manifest(format=m3u8-aapl)');
+  assert.equal(absolutize('https://a.b/x/master.m3u8)', BASE), 'https://a.b/x/master.m3u8');
+  assert.equal(absolutize('https://a.b/x/master.m3u8").', BASE), 'https://a.b/x/master.m3u8');
+});
+
+test('findConfigUrls: sigue meta refresh y location.href', () => {
+  const html = `<meta http-equiv="refresh" content="0;url=/player/real?id=1">
+    <script>window.location.href = "https://player.example.net/v/abc";</script>
+    <script>top.location.replace('/go/next');</script>`;
+  const urls = findConfigUrls(html, BASE);
+  assert.equal(urls[0], 'https://vimeus.com/player/real?id=1');
+  assert.ok(urls.includes('https://player.example.net/v/abc'));
+  assert.ok(urls.includes('https://vimeus.com/go/next'));
+});
+
+test('findConfigUrls: lee URLs de API dentro de código empaquetado', () => {
+  const packed = packJs('fetch("/api/source/tt777").then(function(r){return r.json()});');
+  const urls = findConfigUrls(`<script>${packed}</script>`, BASE);
+  assert.ok(urls.includes('https://vimeus.com/api/source/tt777'));
+});
+
+test('describePlaylist: calidad máxima, variantes y directo', () => {
+  const master = ['#EXTM3U',
+    '#EXT-X-STREAM-INF:BANDWIDTH=1000000,RESOLUTION=1280x720', '720.m3u8',
+    '#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1920x1080', '1080.m3u8'].join('\n');
+  assert.deepEqual(describePlaylist(master), { quality: '1080p', variants: 2, live: false });
+  assert.equal(describePlaylist('#EXTM3U\n#EXT-X-STREAM-INF:RESOLUTION=3840x2160\nuhd.m3u8').quality, '4K');
+  assert.deepEqual(describePlaylist('#EXTM3U\n#EXTINF:4,\nseg.ts\n'), { quality: '', variants: 0, live: true });
+  assert.deepEqual(describePlaylist('#EXTM3U\n#EXTINF:4,\nseg.ts\n#EXT-X-ENDLIST'), { quality: '', variants: 0, live: false });
+});
+
+// ---------------------------------------------------------------------------
+// API de listado → metas
+// ---------------------------------------------------------------------------
+test('listingItemToMeta: ids, imágenes y casos sin datos', () => {
+  assert.deepEqual(listingItemToMeta({ tmdb_id: 550, imdb_id: 'TT0137523', title: 'Fight Club', poster: '/p.jpg', backdrop: 'b.jpg' }, 'movie'), {
+    id: 'tt0137523', type: 'movie', name: 'Fight Club',
+    poster: 'https://image.tmdb.org/t/p/w500/p.jpg', background: 'https://image.tmdb.org/t/p/w1280/b.jpg', posterShape: 'poster',
+  });
+  assert.equal(listingItemToMeta({ tmdb_id: '99861', imdb_id: null, title: 'X' }, 'movie').id, 'tmdb:99861');
+  assert.equal(listingItemToMeta({ tmdb_id: 7, title: '', poster: 'https://cdn.example/p.png' }, 'series').poster, 'https://cdn.example/p.png');
+  assert.equal(listingItemToMeta({ tmdb_id: 7, title: '' }, 'series').name, 'tmdb:7');
+  assert.equal(listingItemToMeta({ tmdb_id: 0, imdb_id: 'nope' }, 'movie'), null);
+  assert.equal(listingItemToMeta(null, 'movie'), null);
+});
+
+test('listingPageFromSkip: 50 por página', () => {
+  assert.equal(listingPageFromSkip(undefined), 1);
+  assert.equal(listingPageFromSkip('0'), 1);
+  assert.equal(listingPageFromSkip('49'), 1);
+  assert.equal(listingPageFromSkip('50'), 2);
+  assert.equal(listingPageFromSkip('100'), 3);
+  assert.equal(listingPageFromSkip('abc'), 1);
 });
