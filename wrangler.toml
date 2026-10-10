@@ -4,9 +4,10 @@
 #  Workers (Create Worker) y pegar las variables de [vars] en Settings.
 # ============================================================================
 
-# Se conserva el nombre del Worker para no cambiar la URL *.workers.dev que ya
-# tienen instalada los usuarios del addon.
-name = "unlimplay-proxy-stream"
+# Nombre del Worker YA INSTALADO en Stremio: al desplegar se actualiza zx
+# (https://zx.noe359866.workers.dev) y la URL del addon no cambia. Si despliegas
+# con otro name se crea un Worker nuevo y el addon seguirá apuntando al viejo.
+name = "zx"
 main = "src/index.js"
 compatibility_date = "2025-09-01"
 

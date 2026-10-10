@@ -9,6 +9,7 @@
     "test": "node --test test/*.test.mjs",
     "dev": "wrangler dev --ip 0.0.0.0 --port 8787",
     "deploy": "wrangler deploy",
+    "secrets": "wrangler secret list",
     "tail": "wrangler tail",
     "mock": "node tools/mock-origin.mjs",
     "dev:local": "wrangler dev --ip 0.0.0.0 --port 8787 --var VIMEUS_ORIGIN:http://127.0.0.1:8788 --var VIMEUS_VIEW_KEY:local-test-key --var VIMEUS_REFERER:http://127.0.0.1:8788/ --var VIMEUS_API_KEY:local-api-key"

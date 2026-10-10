@@ -165,7 +165,31 @@ curl -s https://TU-WORKER.workers.dev/catalog/series/vimeus-animes/skip=50.json 
 3. Si la clave está restringida por dominio, configura `VIMEUS_REFERER` con el origen autorizado. El Worker no evade una lista de dominios: si Vimeus rechaza la solicitud, el addon responde sin streams y lo indica en `X-Proxy-Detail`.
 4. Instala en Stremio: `https://TU-WORKER.workers.dev/manifest.json`.
 
-El nombre del Worker en `wrangler.toml` y el `id` del manifiesto (`com.cf.unlimplay.proxy`) se conservan para que la URL `*.workers.dev` y las instalaciones existentes de Stremio sigan funcionando tras actualizar. Para un dominio propio, configura la ruta `routes` en `wrangler.toml` según Cloudflare.
+El `id` del manifiesto (`com.cf.unlimplay.proxy`) se conserva para que las instalaciones existentes de Stremio sigan funcionando tras actualizar. Para un dominio propio, configura la ruta `routes` en `wrangler.toml` según Cloudflare.
+
+### Actualizar un Worker ya instalado (sin cambiar la URL del addon)
+
+Si el addon ya está instalado en Stremio y ves `{"streams": []}` en **todos** los títulos, lo habitual es que el Worker esté corriendo una versión vieja del código (la v1 no tiene `/debug`, `/proxy` ni los catálogos, y su extractor ya no reconoce el embed actual de Vimeus). Para actualizarlo **sin tocar la URL que Stremio ya conoce**:
+
+```bash
+npm install
+npx wrangler login                  # sólo la primera vez; abre el navegador
+npm run secrets                     # verifica que aparezca VIMEUS_VIEW_KEY
+npx wrangler secret put VIMEUS_VIEW_KEY   # sólo si falta
+npm run deploy                      # despliega al Worker "zx" (ver name en wrangler.toml)
+```
+
+`wrangler.toml` fija `name = "zx"`, así que `npm run deploy` **actualiza el Worker existente** (`zx.<cuenta>.workers.dev`) en lugar de crear uno nuevo; los secretos ya configurados se conservan. Si despliegas con otro nombre, el addon seguirá apuntando al Worker viejo. Alternativa sin terminal: en el panel de Cloudflare, entra al Worker → *Quick edit* y pega el contenido de `src/index.js`.
+
+Verifica el despliegue (sustituye la URL por la tuya):
+
+```bash
+curl -s https://TU-WORKER.workers.dev/manifest.json | head -c 300
+curl -sD - -o /dev/null "https://TU-WORKER.workers.dev/stream/movie/tt0133093.json" | grep -i x-proxy
+curl -s "https://TU-WORKER.workers.dev/stream/movie/tt0133093.json"
+```
+
+Si sigue sin devolver streams, levanta el diagnóstico con `DEBUG_TOKEN` (ver *Depurar un título concreto*): lista cada página visitada, su estado HTTP y el HTML real de Vimeus para afinar el extractor.
 
 ## Desarrollo y pruebas locales
 
