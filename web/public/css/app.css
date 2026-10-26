@@ -1,3 +1,54 @@
+/* Tipografías servidas desde /fonts: la interfaz se ve igual sin acceso a Google Fonts. */
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/inter-latin-400-normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("/fonts/inter-latin-500-normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url("/fonts/inter-latin-600-normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("/fonts/inter-latin-700-normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Bebas Neue";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/bebas-neue-latin-400-normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/ibm-plex-mono-latin-400-normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url("/fonts/ibm-plex-mono-latin-600-normal.woff2") format("woff2");
+}
+
 :root {
   --bg: #000;
   --bg-2: #0b0f14;
@@ -713,6 +764,79 @@ img { max-width: 100%; display: block; }
   text-align: center;
   color: var(--muted);
 }
+
+/* Estado de conexión y catálogo de muestra local (primer pintado sin red). */
+/* La tira va antes del héroe: evitamos que el margin-top negativo del héroe
+   (pensado para ocultarse bajo la cabecera) la tape por completo. */
+.demo-strip + .hero {
+  margin-top: 0;
+  min-height: 64vh;
+}
+.demo-strip {
+  position: relative;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 11px 40px;
+  background: linear-gradient(90deg, rgba(0,168,225,0.12), rgba(196,75,255,0.07));
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.4;
+}
+.demo-strip strong { color: #fff; }
+.demo-strip .dot {
+  flex: none;
+  width: 9px; height: 9px;
+  border-radius: 50%;
+  background: var(--warn);
+  box-shadow: 0 0 0 4px rgba(255,176,32,0.14);
+  animation: pulse 1.6s infinite;
+}
+.demo-strip.online .dot {
+  background: var(--ok);
+  box-shadow: 0 0 0 4px rgba(62,224,160,0.14);
+  animation: none;
+}
+.demo-strip .spacer { flex: 1; }
+.demo-strip .btn { height: 34px; padding: 0 14px; font-size: 12px; }
+.demo-strip code {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--faint);
+}
+@keyframes pulse { 50% { opacity: 0.35; } }
+
+.demo-tag {
+  position: absolute;
+  bottom: 8px; left: 8px;
+  z-index: 1;
+  padding: 3px 6px;
+  border-radius: 2px;
+  background: rgba(0,0,0,0.7);
+  border: 1px solid rgba(255,255,255,0.18);
+  color: #dbe3ea;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.demo-steps {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 12px;
+  margin: 4px 0 22px;
+}
+.demo-steps .step {
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: linear-gradient(160deg, rgba(21,28,36,0.9), rgba(11,15,20,0.9));
+}
+.demo-steps .step b { display: block; color: var(--prime); font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase; margin-bottom: 8px; }
+.demo-steps .step span { color: var(--muted); font-size: 13px; line-height: 1.5; }
 .skel {
   background: linear-gradient(90deg, #141b22, #1e2832, #141b22);
   background-size: 200% 100%;
@@ -956,7 +1080,7 @@ img { max-width: 100%; display: block; }
   .mast { padding: 0 16px; gap: 12px; }
   .nav { display: none; }
   .hero-body { padding: 120px 20px 48px; }
-  .section, .page { padding-left: 16px; padding-right: 16px; }
+  .section, .page, .demo-strip { padding-left: 16px; padding-right: 16px; }
   .detail-wrap { grid-template-columns: 1fr; padding: 28px 16px; }
   .detail-poster { max-width: 180px; }
   .engine-grid, .form-grid { grid-template-columns: 1fr; }
