@@ -1,3 +1,17 @@
+# ZX — cliente web de addons Stremio + addon Vimeus
+
+## Cliente web
+
+Interfaz para **instalar addons de Stremio**, recorrer catálogos y reproducir con **MediaFlow Proxy**, **TorrServer**, **Webtor** (`https://abra--5e4bd524.api.cosmic-crab.buzz`) y un reproductor estilo **Media3 ExoPlayer**.
+
+```bash
+npm run web          # http://0.0.0.0:8787
+```
+
+Detalles en [`web/README.md`](web/README.md). Cinemeta viene de fábrica; pega cualquier `manifest.json` en Addons.
+
+---
+
 # Vimeus HLS — Addon de Stremio en Cloudflare Workers
 
 Worker ES Module que resuelve una URL HLS (`.m3u8`) para Stremio **exclusivamente desde Vimeus**. El Worker entrega a Stremio el enlace HLS encontrado, con las cabeceras necesarias; opcionalmente puede retransmitir la playlist y sus segmentos mediante `/proxy`.
