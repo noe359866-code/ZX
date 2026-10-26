@@ -142,6 +142,13 @@ function serveStatic(req, res, urlPath) {
   }
   fs.stat(file, (err, st) => {
     if (err || !st.isFile()) {
+      // Los assets que faltan devuelven 404: si se respondiera index.html,
+      // el navegador intentaría parsear HTML como fuente, script o imagen.
+      if (path.extname(rel)) {
+        res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+        res.end("not found");
+        return;
+      }
       const index = path.join(PUBLIC, "index.html");
       fs.readFile(index, (e2, buf) => {
         if (e2) {
@@ -267,7 +274,7 @@ function tryParse(text) {
   }
 }
 
-const server = http.createServer(async (req, res) => {
+async function handler(req, res) {
   setCors(res);
   if (req.method === "OPTIONS") {
     res.writeHead(204);
@@ -290,8 +297,16 @@ const server = http.createServer(async (req, res) => {
   } catch (err) {
     json(res, 500, { error: err.message || "internal" });
   }
-});
+}
 
-server.listen(PORT, HOST, () => {
-  console.log(`ZX web listening on http://${HOST}:${PORT}`);
-});
+export function createServer() {
+  return http.createServer(handler);
+}
+
+// Sólo escuchamos cuando se ejecuta directamente (`npm run web`). Al importar
+// el módulo desde los tests se puede elegir un puerto efímero (0).
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  createServer().listen(PORT, HOST, () => {
+    console.log(`ZX web listening on http://${HOST}:${PORT}`);
+  });
+}

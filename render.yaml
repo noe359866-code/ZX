@@ -1,0 +1,15 @@
+# Blueprint para Render.com (también válido como referencia para cualquier PaaS).
+# El servidor ya escucha en 0.0.0.0 y respeta la variable PORT que inyecta Render.
+services:
+  - type: web
+    name: zx-web
+    runtime: node
+    plan: free
+    buildCommand: npm ci --omit=dev
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: NODE_ENV
+        value: production

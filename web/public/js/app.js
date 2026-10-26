@@ -13,10 +13,52 @@ import {
 import { resolveStream, pingTorrServer, pingMediaFlow, pingWebtor, streamKind } from "./engines.js";
 import { startDeviceAuth, pollDeviceToken, listLibrary as webtorLibrary } from "./webtor.js";
 import { ZXPlayer } from "./player.js";
+import { DEMO_ROWS, DEMO_MOVIES, DEMO_SERIES, demoMeta, demoSearch, demoStreams, isDemoId } from "./demo.js";
 
 const $ = (s, r = document) => r.querySelector(s);
 const view = $("#view");
 const player = new ZXPlayer($("#player-root"));
+
+// Cada navegación invalida los renderizados asíncronos anteriores. Así una
+// respuesta tardía de un addon no pisa la pantalla que el usuario ya abrió.
+let renderToken = 0;
+
+function bootDone() {
+  const boot = $("#boot");
+  if (!boot) return;
+  boot.classList.add("off");
+  setTimeout(() => boot.remove(), 300);
+}
+
+function statusStrip(state, detail = "") {
+  const copy = {
+    loading: ["Conectando con tus addons…", "Mientras tanto ves el catálogo de muestra local."],
+    offline: ["Sin conexión con los addons", detail || "Cinemeta y los addons instalados no respondieron. La interfaz sigue funcionando con el catálogo de muestra."],
+    online: ["Catálogos cargados", detail || "Contenido real de tus addons."],
+  }[state];
+  return `<div class="demo-strip ${state === "online" ? "online" : ""}" id="status-strip" role="status">
+    <span class="dot"></span>
+    <span><strong>${esc(copy[0])}</strong> · ${esc(copy[1])}</span>
+    <span class="spacer"></span>
+    <button class="btn btn-ghost" data-retry>Reintentar</button>
+    <button class="btn btn-ghost" data-go="addons">Configurar addons</button>
+  </div>`;
+}
+
+function setStatus(state, detail) {
+  const strip = $("#status-strip");
+  if (!strip) return;
+  const holder = document.createElement("div");
+  holder.innerHTML = statusStrip(state, detail);
+  strip.replaceWith(holder.firstElementChild);
+}
+
+function demoRow(row) {
+  return `<section class="section">
+    <div class="section-head"><h2>${esc(row.title)}</h2></div>
+    <div class="scroller">${row.metas.map(card).join("")}</div>
+  </section>`;
+}
 
 function toast(msg, err = false) {
   const el = document.createElement("div");
@@ -54,6 +96,7 @@ function card(meta) {
   const kind = meta.type === "series" ? "Serie" : meta.type === "movie" ? "Película" : meta.type;
   return `<button class="card" data-open="${esc(meta.type)}:${esc(meta.id)}">
     <div class="poster">${posterEl(meta)}${meta.imdbRating ? `<span class="badge">★ ${esc(meta.imdbRating)}</span>` : ""}
+      ${meta._demo ? `<span class="demo-tag">Muestra local</span>` : ""}
       <div class="play-hit"><span>${svgPlay()}</span></div>
     </div>
     <div class="card-title">${esc(meta.name)}</div>
@@ -62,6 +105,8 @@ function card(meta) {
 }
 
 function route() {
+  renderToken += 1;
+  bootDone();
   const hash = location.hash.replace(/^#/, "") || "/";
   const [path, qs] = hash.split("?");
   const q = new URLSearchParams(qs || "");
@@ -93,63 +138,74 @@ function go(hash) {
 }
 
 async function renderHome() {
-  view.innerHTML = `
-    <section class="hero skel" id="hero"></section>
-    <div id="cw"></div>
-    <div id="rows">${Array.from({ length: 3 }, () => `<section class="section"><div class="section-head"><div class="skel" style="height:18px;width:180px"></div></div><div class="scroller">${Array.from({ length: 8 }, () => `<div class="skel" style="flex:0 0 168px;height:252px"></div>`).join("")}</div></section>`).join("")}</div>
-  `;
+  const token = renderToken;
   const cw = store.profile()?.continueWatching || [];
-  if (cw.length) {
-    $("#cw").innerHTML = `<section class="section"><div class="section-head"><h2>Seguir viendo</h2></div><div class="scroller">${cw.map(card).join("")}</div></section>`;
-  }
+  const cwHtml = cw.length
+    ? `<section class="section"><div class="section-head"><h2>Seguir viendo</h2></div><div class="scroller">${cw.map(card).join("")}</div></section>`
+    : "";
+
+  // 1) Primer pintado inmediato y 100 % local: héroe, filas y estado. Nunca
+  //    dejamos una pantalla negra esperando a Cinemeta o a un proxy CORS.
+  const demoBoard = `
+    ${statusStrip("loading")}
+    <section class="hero" id="hero">${heroMarkup(DEMO_MOVIES[0])}</section>
+    <div id="cw">${cwHtml}</div>
+    <div id="rows">
+      <div class="page" style="padding-top:0;padding-bottom:0">
+        <div class="demo-steps">
+          <div class="step"><b>01 · Catálogo</b><span>Cinemeta trae películas y series de fábrica. Pega el manifest.json de cualquier addon en <strong>Addons</strong>.</span></div>
+          <div class="step"><b>02 · Motores</b><span>HLS directo o MediaFlow Proxy, torrents con TorrServer y Webtor. Se configuran en <strong>Motores</strong>.</span></div>
+          <div class="step"><b>03 · Reproductor</b><span>ZX Player usa hls.js servido desde este mismo servidor: sin CDN, sin scripts de terceros.</span></div>
+        </div>
+      </div>
+      ${DEMO_ROWS.map(demoRow).join("")}
+    </div>`;
+  view.innerHTML = demoBoard;
+  view._featured = DEMO_MOVIES[0];
+
+  // 2) Detrás, los addons reales. Si responden, sustituyen el tablero entero.
   const rows = boardCatalogs().slice(0, 8);
   if (!rows.length) {
-    $("#rows").innerHTML = `<div class="empty">Instala un addon con catálogos (Cinemeta ya viene de fábrica) o activa los que tengas en Addons.</div>`;
-    $("#hero").classList.remove("skel");
-    $("#hero").innerHTML = heroMarkup({
-      name: "ZX",
-      description: "Instala addons de Stremio, reproduce HLS con MediaFlow Proxy y torrents con TorrServer o Webtor.",
-      type: "movie",
-      id: "",
-    });
+    setStatus("offline", "No hay addons con catálogos activos. Activa Cinemeta o instala uno nuevo.");
     return;
   }
   const loaded = await Promise.all(
     rows.map(async (row) => {
       try {
         const metas = await loadCatalog(row.addon, row.catalog, {});
-        return { ...row, metas };
+        return { ...row, metas: Array.isArray(metas) ? metas : [] };
       } catch {
         return { ...row, metas: [] };
       }
     })
   );
-  const featured = loaded.find((r) => r.metas.length)?.metas[0];
-  if (featured) {
-    try {
-      const full = (await loadMeta(featured.type, featured.id)) || featured;
-      view._featured = full;
-      $("#hero").classList.remove("skel");
-      $("#hero").innerHTML = heroMarkup(full);
-    } catch {
-      view._featured = featured;
-      $("#hero").classList.remove("skel");
-      $("#hero").innerHTML = heroMarkup(featured);
-    }
-  } else {
-    $("#hero").remove();
+  if (token !== renderToken) return;
+  const good = loaded.filter((r) => r.metas.length);
+  if (!good.length) {
+    setStatus("offline");
+    return;
   }
-  $("#rows").innerHTML = loaded
-    .filter((r) => r.metas.length)
-    .map(
-      (r) => `<section class="section">
-        <div class="section-head">
-          <h2>${esc(rowTitle(r))}</h2>
-        </div>
-        <div class="scroller">${r.metas.map(card).join("")}</div>
-      </section>`
-    )
-    .join("");
+  const featured = good[0].metas[0];
+  let full = featured;
+  try {
+    full = (await loadMeta(featured.type, featured.id)) || featured;
+  } catch {
+    /* la ficha del catálogo ya sirve */
+  }
+  if (token !== renderToken) return;
+  view._featured = full;
+  view.innerHTML = `
+    ${statusStrip("online", `${good.length} catálogos · ${enabledAddons().length} addons activos`)}
+    <section class="hero" id="hero">${heroMarkup(full)}</section>
+    <div id="cw">${cwHtml}</div>
+    <div id="rows">${good
+      .map(
+        (r) => `<section class="section">
+          <div class="section-head"><h2>${esc(rowTitle(r))}</h2></div>
+          <div class="scroller">${r.metas.map(card).join("")}</div>
+        </section>`
+      )
+      .join("")}</div>`;
 }
 
 function heroMarkup(meta) {
@@ -158,14 +214,14 @@ function heroMarkup(meta) {
   return `
     <div class="hero-bg" style="background-image:url('${esc(bg)}')"></div>
     <div class="hero-body">
-      <div class="included">Incluido con ZX</div>
+      <div class="included">${meta._demo ? "Muestra local · ZX" : "Incluido con ZX"}</div>
       <h1>${esc(meta.name || "ZX")}</h1>
       <div class="meta-line">
         ${meta.imdbRating ? `<span>★ ${esc(meta.imdbRating)}</span>` : ""}
         ${yearOf(meta) ? `<span>${esc(yearOf(meta))}</span>` : ""}
         ${meta.runtime ? `<span>${esc(meta.runtime)}</span>` : ""}
         <span class="pill hd">${esc(kind)}</span>
-        <span class="pill hd">4K</span>
+        ${meta._demo ? `<span class="pill hd">Demo</span>` : `<span class="pill hd">4K</span>`}
         ${(meta.genres || []).slice(0, 2).map((g) => `<span>${esc(g)}</span>`).join("")}
       </div>
       <p>${esc((meta.description || "").slice(0, 220))}</p>
@@ -186,58 +242,84 @@ function rowTitle(r) {
 }
 
 async function renderDiscover(type) {
+  const token = renderToken;
   const title = type === "series" ? "Series" : type === "movie" ? "Películas" : "Explorar";
-  view.innerHTML = `<div class="page"><h1>${title}</h1>
-    <div class="chips" style="margin:0 0 18px;justify-content:flex-start">
-      ${[
-        ["movie", "Películas"],
-        ["series", "Series"],
-        ["tv", "TV"],
-        ["channel", "Canales"],
-      ].map(([t, label]) => `<button class="chip ${t === type ? "on" : ""}" data-go="discover?type=${t}">${label}</button>`).join("")}
+  const sample = type === "series" ? DEMO_SERIES : type === "movie" ? DEMO_MOVIES : [];
+  const chips = `<div class="chips" style="margin:0 0 18px;justify-content:flex-start">
+    ${[
+      ["movie", "Películas"],
+      ["series", "Series"],
+      ["tv", "TV"],
+      ["channel", "Canales"],
+    ].map(([t, label]) => `<button class="chip ${t === type ? "on" : ""}" data-go="discover?type=${t}">${label}</button>`).join("")}
+  </div>`;
+  view.innerHTML = `<div class="page"><h1>${title}</h1>${chips}
+    <div id="disc">${statusStrip("loading")}
+      ${sample.length ? `<div class="grid">${sample.map(card).join("")}</div>` : `<div class="empty">Este tipo depende de tus addons.</div>`}
     </div>
-    <div id="disc" class="grid">${Array.from({ length: 12 }, () => `<div class="skel" style="height:240px"></div>`).join("")}</div>
   </div>`;
   const rows = boardCatalogs().filter((r) => r.catalog.type === type);
   const lists = await Promise.all(
     rows.slice(0, 4).map((r) => loadCatalog(r.addon, r.catalog, {}).catch(() => []))
   );
+  if (token !== renderToken) return;
   const seen = new Set();
   const metas = [];
   for (const list of lists) {
-    for (const m of list) {
+    for (const m of list || []) {
       if (seen.has(m.id)) continue;
       seen.add(m.id);
       metas.push(m);
     }
   }
-  $("#disc").innerHTML = metas.length ? metas.map(card).join("") : `<div class="empty">No hay catálogos de tipo ${esc(type)}.</div>`;
+  if (!metas.length) {
+    setStatus("offline", sample.length ? "Mostrando la muestra local mientras no respondan los addons." : "Sin catálogos de este tipo.");
+    return;
+  }
+  $("#disc").innerHTML = `${statusStrip("online", `${metas.length} títulos`)}<div class="grid">${metas.map(card).join("")}</div>`;
 }
 
 async function renderSearch(q) {
+  const token = renderToken;
   $("#q").value = q;
-  view.innerHTML = `<div class="page"><h1>Buscar</h1><p class="lead">${q ? "Resultados para «" + esc(q) + "»" : "Escribe en la barra superior. Se consulta el extra search de todos los addons."}</p><div class="grid" id="res">${q ? Array.from({ length: 8 }, () => `<div class="skel" style="height:240px"></div>`).join("") : ""}</div></div>`;
+  const sample = demoSearch(q);
+  view.innerHTML = `<div class="page"><h1>Buscar</h1><p class="lead">${q ? "Resultados para «" + esc(q) + "»" : "Escribe en la barra superior. Se consulta el extra search de todos los addons."}</p>
+    <div id="res">${q ? `${statusStrip("loading")}<div class="grid">${sample.map(card).join("")}</div>` : ""}</div></div>`;
   if (!q) return;
   try {
     const metas = await searchAll(q);
-    $("#res").innerHTML = metas.length ? metas.map(card).join("") : `<div class="empty">Sin resultados.</div>`;
+    if (token !== renderToken) return;
+    if (metas.length) {
+      $("#res").innerHTML = `${statusStrip("online", `${metas.length} resultados`)}<div class="grid">${metas.map(card).join("")}</div>`;
+    } else {
+      setStatus("offline", "Ningún addon respondió; abajo tienes la muestra local.");
+      if (!sample.length) $("#res").insertAdjacentHTML("beforeend", `<div class="empty">Sin resultados.</div>`);
+    }
   } catch (err) {
-    $("#res").innerHTML = `<div class="empty">${esc(err.message)}</div>`;
+    if (token !== renderToken) return;
+    setStatus("offline", err.message || "No se pudo buscar en los addons.");
   }
 }
 
 async function renderDetail(type, id) {
-  view.innerHTML = `<div class="page"><div class="skel" style="height:360px;border-radius:24px"></div></div>`;
-  let meta;
-  try {
-    meta = await loadMeta(type, id);
-  } catch (err) {
-    view.innerHTML = `<div class="page"><div class="empty">${esc(err.message)}</div></div>`;
-    return;
+  const token = renderToken;
+  const local = isDemoId(id) ? demoMeta(id) : null;
+  if (!local) view.innerHTML = `<div class="page"><div class="skel" style="height:360px;border-radius:24px"></div></div>`;
+  let meta = local;
+  if (!local) {
+    try {
+      meta = await loadMeta(type, id);
+    } catch (err) {
+      view.innerHTML = `<div class="page"><div class="empty">${esc(err.message)}</div></div>`;
+      return;
+    }
+    if (token !== renderToken) return;
+    if (!meta) meta = { id, type, name: id };
   }
-  if (!meta) {
-    meta = { id, type, name: id };
-  }
+  paintDetail(meta, type, id);
+}
+
+function paintDetail(meta, type, id) {
   const videos = meta.videos || [];
   const seasons = [...new Set(videos.map((v) => v.season).filter((s) => s != null))].sort((a, b) => a - b);
   const inLib = store.inLibrary(meta.id);
@@ -247,7 +329,7 @@ async function renderDetail(type, id) {
       <div class="detail-wrap">
         <div class="detail-poster">${posterEl(meta)}</div>
         <div>
-          <div class="included">Incluido con ZX</div>
+          <div class="included">${meta._demo ? "Muestra local · ZX" : "Incluido con ZX"}</div>
           <h1>${esc(meta.name)}</h1>
           <div class="meta-line">${yearOf(meta) ? `<span>${esc(yearOf(meta))}</span>` : ""}${meta.runtime ? `<span>${esc(meta.runtime)}</span>` : ""}${(meta.genres || []).map((g) => `<span>${esc(g)}</span>`).join("")}</div>
           <p class="desc">${esc(meta.description || "Sin sinopsis.")}</p>
@@ -293,8 +375,10 @@ async function renderDetail(type, id) {
 async function fillStreams(type, id, meta) {
   const box = $("#streams");
   if (!box) return;
+  const token = renderToken;
   try {
-    const streams = await loadStreams(type, id);
+    const streams = isDemoId(id) ? demoStreams(id) : await loadStreams(type, id);
+    if (token !== renderToken || !box.isConnected) return;
     if (!streams.length) {
       box.innerHTML = `<div class="empty">Ningún addon devolvió streams. Instala uno de streams (Torrentio, MediaFusion, tu Worker Vimeus, etc.).</div>`;
       return;
@@ -631,6 +715,7 @@ function renderGate() {
       }
     </div>
     <div class="gate-actions">
+      ${!manage ? `<button class="btn btn-primary" data-gate-start>Entrar</button>` : ""}
       <button class="btn btn-ghost" data-gate-manage>${manage ? "Listo" : "Administrar perfiles"}</button>
       ${store.state.activeProfileId ? `<button class="btn btn-ghost" data-gate-close>Cerrar</button>` : ""}
       <button class="btn btn-ghost" data-go="settings" data-gate-close>Motores y cuenta</button>
@@ -686,6 +771,22 @@ function renderGateForm(box) {
 
 document.addEventListener("click", (e) => {
   if (e.target.closest("[data-gate-close]")) closeGate();
+  if (e.target.closest("[data-gate-start]")) {
+    const first = store.profiles()[0];
+    if (first) store.selectProfile(first.id);
+    closeGate();
+    syncChrome();
+    route();
+    return;
+  }
+  if (e.target.closest("[data-retry]")) {
+    setStatus("loading");
+    toast("Reconectando con los addons…");
+    refreshManifests()
+      .catch(() => {})
+      .finally(() => route());
+    return;
+  }
   const manageBtn = e.target.closest("[data-gate-manage]");
   if (manageBtn) {
     gateMode = gateMode === "manage" ? "pick" : "manage";
@@ -826,11 +927,21 @@ $("#who")?.addEventListener("click", (e) => {
   openGate("pick");
 });
 
+// Arranque: la interfaz se pinta ANTES de cualquier petición de red. Si sólo
+// hay un perfil se entra directo (la puerta de perfiles sigue en el avatar).
 store.persist();
+if (!store.state.activeProfileId && store.profiles().length === 1) {
+  store.selectProfile(store.profiles()[0].id);
+}
 syncChrome();
+route();
 if (!store.state.activeProfileId) openGate("pick");
+
+// Los manifiestos se actualizan en segundo plano: nunca bloquean el render.
 refreshManifests()
   .catch(() => {})
   .finally(() => {
-    if (store.state.activeProfileId) route();
+    const strip = $("#status-strip");
+    const onHome = !location.hash || location.hash === "#/" || location.hash === "#";
+    if (strip && !strip.classList.contains("online") && onHome && view.scrollTop < 40) route();
   });

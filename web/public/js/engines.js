@@ -194,12 +194,16 @@ export async function resolveStream(stream, meta) {
 
   if (!stream.url) throw new Error("El stream no tiene URL");
   const headers = headersFromStream(stream);
+  // `notWebReady: false` es una declaración explícita del addon (o de la
+  // muestra local) de que el HLS se puede pedir desde el navegador: no lo
+  // enviemos a MediaFlow aunque el usuario tenga activado preferProxyHls.
+  const webReady = stream.behaviorHints?.notWebReady === false;
   const needsProxy =
     settings.mediaflowEnabled &&
     settings.mediaflowUrl &&
     (Object.keys(headers).length > 0 ||
-      stream.behaviorHints?.notWebReady ||
-      (settings.preferProxyHls && (kind === "hls" || kind === "dash")));
+      (!webReady &&
+        (stream.behaviorHints?.notWebReady || (settings.preferProxyHls && (kind === "hls" || kind === "dash")))));
   if (needsProxy) {
     const playUrl = mediaflowUrl(stream.url, { headers, kind }, settings);
     return { playUrl, engine: "MediaFlow Proxy", kind: kind === "dash" ? "hls" : kind, headers };

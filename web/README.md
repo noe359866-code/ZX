@@ -11,6 +11,8 @@ Interfaz web que instala **addons de Stremio** (`manifest.json`) y reproduce sus
 
 Media3 ExoPlayer es una librería de Android: en el navegador no puede ejecutarse. ZX Player replica su barra de controles, *seek*, velocidad, subtítulos y teclas (espacio, flechas, F, M, Esc) sobre MSE/`hls.js`.
 
+![ZX renderizando sin conexión a los addons](docs/preview.jpg)
+
 ## Arranque
 
 ```bash
@@ -19,6 +21,37 @@ npm run web
 ```
 
 Cinemeta viene instalado para catálogos y fichas. En **Addons** pega cualquier `https://…/manifest.json` (Torrentio, MediaFusion, el Worker Vimeus de este repo, etc.).
+
+## Render sin red (primer pintado)
+
+La web está preparada para verse completa en una preview o en una LAN sin
+salida a internet:
+
+- **Sin CDN**: `hls.js` está en `public/vendor/` y las tipografías Inter, Bebas
+  Neue e IBM Plex Mono en `public/fonts/` (licencias en
+  [`THIRD_PARTY.md`](THIRD_PARTY.md)). `index.html` incluye una pantalla de
+  carga mínima con estilos en línea y un mensaje de error si un módulo falla.
+- **Arranque no bloqueante**: `app.js` pinta el héroe, las filas y el estado de
+  conexión antes de pedir nada a la red. `refreshManifests()` corre en segundo
+  plano. Un contador de render evita que respuestas tardías pisen la vista
+  actual.
+- **Catálogo de muestra local**: `public/js/demo.js` genera fichas de dominio
+  público con pósters SVG. Se muestran marcadas como «Muestra local» mientras
+  los addons cargan o si fallan; en cuanto un addon real devuelve metas, el
+  tablero se sustituye. La tira de estado ofrece **Reintentar** y acceso a
+  **Addons**.
+- **Perfil único**: se entra directo; el selector sigue accesible desde el
+  avatar y tiene un botón **Entrar** explícito.
+
+Los streams de muestra apuntan a fuentes de prueba públicas (Mux HLS y el MP4
+de MDN): la interfaz y el reproductor funcionan sin addons, pero esos vídeos
+concretos sí necesitan internet.
+
+Tests de render (jsdom + servidor efímero):
+
+```bash
+npm test     # incluye test/web.render.test.mjs, web.catalog.test.mjs y web.static.test.mjs
+```
 
 ## Ajustes
 

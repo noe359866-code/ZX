@@ -5,10 +5,31 @@
 Interfaz para **instalar addons de Stremio**, recorrer catálogos y reproducir con **MediaFlow Proxy**, **TorrServer**, **Webtor** (`https://abra--5e4bd524.api.cosmic-crab.buzz`) y un reproductor estilo **Media3 ExoPlayer**.
 
 ```bash
-npm run web          # http://0.0.0.0:8787
+npm run web          # http://0.0.0.0:8787 (escucha en 0.0.0.0; respeta $PORT)
 ```
 
-Detalles en [`web/README.md`](web/README.md). Cinemeta viene de fábrica; pega cualquier `manifest.json` en Addons.
+La interfaz **renderiza sin red externa**: hls.js, las tipografías, los iconos y
+un catálogo de muestra están dentro del repo. El primer pintado es inmediato;
+los catálogos de los addons se cargan en segundo plano y sustituyen la muestra
+cuando responden. Si Cinemeta o el proxy CORS no están disponibles, la tira de
+estado lo indica y la web sigue siendo navegable (fichas, episodios, reproductor).
+
+Detalles en [`web/README.md`](web/README.md). Cinemeta viene de fábrica; pega
+cualquier `manifest.json` en Addons.
+
+### Despliegue
+
+`npm start` es el proceso de producción y `GET /api/health` el healthcheck. Hay
+un [`render.yaml`](render.yaml) listo para crear un *Web Service* en Render.com;
+en cualquier otro PaaS basta con:
+
+```bash
+npm ci --omit=dev
+PORT=8080 npm start
+```
+
+No hay build de frontend ni variables obligatorias: el cliente es HTML/CSS/JS
+estático servido por `web/server.mjs`.
 
 ---
 
