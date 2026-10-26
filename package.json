@@ -3,9 +3,11 @@
   "version": "2.0.0",
   "private": true,
   "type": "module",
-  "description": "Addon proxy de Stremio (Cloudflare Worker) que resuelve HLS desde Vimeus.",
+  "description": "Cliente web de addons Stremio (MediaFlow, TorrServer, Webtor) y addon Vimeus en Cloudflare Workers.",
   "main": "src/index.js",
   "scripts": {
+    "web": "node web/server.mjs",
+    "start": "node web/server.mjs",
     "test": "node --test test/*.test.mjs",
     "dev": "wrangler dev --ip 0.0.0.0 --port 8787",
     "deploy": "wrangler deploy",

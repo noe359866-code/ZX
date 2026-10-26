@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ZX</title>
+    <meta name="theme-color" content="#000000" />
+    <meta name="description" content="ZX — películas y series. Addons de Stremio, MediaFlow, TorrServer y Webtor." />
+    <link rel="icon" href="/img/favicon.png" />
+    <link rel="apple-touch-icon" href="/img/icon-192.png" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/css/app.css" />
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js" defer></script>
+  </head>
+  <body>
+    <div class="app">
+      <header class="mast" id="mast">
+        <a class="logo" href="#/" title="ZX">
+          <img src="/img/icon-192.png" alt="" />
+          <span>ZX</span>
+        </a>
+        <nav class="nav">
+          <button class="nav-link active" data-go="/">Inicio</button>
+          <button class="nav-link" data-go="discover?type=movie">Películas</button>
+          <button class="nav-link" data-go="discover?type=series">Series</button>
+          <button class="nav-link" data-go="library">Mi lista</button>
+          <button class="nav-link" data-go="addons">Addons</button>
+        </nav>
+        <label class="search">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3-3"/></svg>
+          <input id="q" type="search" placeholder="Buscar" autocomplete="off" />
+        </label>
+        <button class="avatar" id="who" title="Cambiar perfil">
+          <span class="who-face" id="who-face">P</span>
+        </button>
+      </header>
+      <main class="view" id="view"></main>
+    </div>
+    <div class="gate hidden" id="gate"></div>
+    <div class="player-root" id="player-root"></div>
+    <div class="toast-root" id="toast-root"></div>
+    <script type="module" src="/js/app.js"></script>
+  </body>
+</html>
